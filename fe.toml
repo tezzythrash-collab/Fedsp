@@ -1,4 +1,7 @@
-# Ingot config
-[ingot]
+# Workspace config: the FeDSP library ingot plus the DspDemo contract
+# ingot that exercises it as an on-chain dependency.
+[workspace]
 name = "fedsp"
-version = "0.1.0"
+version = "0.4.0"
+members = ["ingots/*"]
+exclude = ["target"]
