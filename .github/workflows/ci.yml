@@ -21,19 +21,29 @@ jobs:
       - name: Check Fe version
         run: fe --version
 
-      - name: Format check
-        run: fe fmt --check
+      - name: Format check (library)
+        run: fe fmt --check ingots/fedsp
 
-      - name: Type check
+      - name: Format check (demo contract)
+        run: fe fmt --check ingots/demo
+
+      - name: Type check (workspace)
         run: fe check
 
-      - name: Test (sonatina backend)
+      - name: Test (sonatina backend, both members)
         run: fe test
 
-      - name: Test (native backend)
-        run: fe test --backend native
+      - name: Test (native backend, library only)
+        run: fe test --backend native ingots/fedsp
 
-# NOTE: `fe build` is intentionally NOT run here. FeDSP is a pure library
-# with no contracts, and `fe build` exits 1 with "No contracts found to
-# build". The library is verified by `fe check` + `fe test` on both
-# backends, which is the complete build surface for this ingot.
+      - name: Build (DspDemo contract)
+        run: fe build
+
+# NOTE: the demo contract's test is sonatina-only. Fe 26.5.0's native
+# backend cannot lower EVM instructions (EvmSstore, EvmCallValue), so
+# any ingot containing a contract test fails `fe test --backend native`
+# at codegen — including unrelated pure tests in the same ingot
+# (verified by probe). That is why DspDemo lives in its own workspace
+# member: the library suite stays green on both backends, and the
+# contract test runs on sonatina. `fe build` compiles the contract to
+# out/DspDemo.{bin,runtime.bin} + out/DspDemo.abi.json.
