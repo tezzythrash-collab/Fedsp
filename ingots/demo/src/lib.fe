@@ -1,0 +1,232 @@
+// DspDemo — the FeDSP library used as an on-chain dependency.
+//
+// A small contract that runs the full FeDSP signal chain inside a
+// recv handler: Hann window -> 4-tap moving-average FIR -> Butterworth
+// lowpass biquad -> RMS / energy -> FFT magnitude peak. Two entry
+// points: `RunDemo` runs the chain on the documented demo burst (no
+// arguments), and `RunChain` runs it on a caller-supplied 16-sample
+// Q15 frame. Everything is pure computation — no storage, no effects
+// beyond the call itself — so the contract proves the library works
+// as a dependency of real contract code, not only in unit tests.
+//
+// Test note (Fe 26.5.0 limitation, verified by probe): the contract
+// test below runs on the sonatina backend only. The native backend
+// cannot lower EVM instructions (`EvmSstore`, `EvmCallValue`), so any
+// ingot containing a contract test fails `fe test --backend native`
+// at codegen — including unrelated pure tests in the same ingot.
+// That is why this contract lives in its own workspace member:
+// `fe test ingots/fedsp` stays green on both backends, and
+// `fe test ingots/demo` runs the contract test on sonatina.
+
+use std::abi::sol
+use std::evm::{Evm, Call}
+use fedsp::{Biquad, Cplx, Fir, HANN16, Q15, energy, fft16, fft_magnitude, rms, window}
+
+/// The result of one signal-chain run, ABI-encoded as a tuple.
+#[abi]
+pub struct ChainResult { pub rms: i32, pub energy: i32, pub fft_peak: i32, pub fft_peak_bin: u256 }
+
+msg DspDemoMsg {
+    #[selector = sol("run_demo()")]
+    RunDemo -> ChainResult,
+    #[selector = sol("run_chain(int32[16])")]
+    RunChain { frame: [i32; 16] } -> ChainResult,
+}
+
+/// The documented demo burst: 16 samples, 2 cycles, amplitude 0.9.
+/// Same burst as `demo_signal_chain` in the library test suite.
+const DEMO_BURST: [i32; 16] = [
+    0,
+    20853,
+    29490,
+    20853,
+    0,
+    -20853,
+    -29490,
+    -20853,
+    0,
+    20853,
+    29490,
+    20853,
+    0,
+    -20853,
+    -29490,
+    -20853,
+]
+
+/// Run one FIR filter over a frame, threading the delay line through.
+fn run_fir(fir: mut Fir<4>, xs: [Q15; 16]) -> [Q15; 16] {
+    var out: [Q15; 16] = [Q15::zero(); 16]
+    var i: usize = 0
+    while i < 16 {
+        out[i] = fir.step(x: xs[i])
+        i += 1
+    }
+    out
+}
+
+/// Run one biquad over a frame, threading the state through.
+fn run_biquad(bq: mut Biquad, xs: [Q15; 16]) -> [Q15; 16] {
+    var out: [Q15; 16] = [Q15::zero(); 16]
+    var i: usize = 0
+    while i < 16 {
+        out[i] = bq.step(x: xs[i])
+        i += 1
+    }
+    out
+}
+
+/// Build a complex frame from a real Q15 frame (`im == 0`).
+fn to_cplx(xs: [Q15; 16]) -> [Cplx; 16] {
+    var out: [Cplx; 16] = [Cplx::zero(); 16]
+    var i: usize = 0
+    while i < 16 {
+        out[i] = Cplx::from_re(re: xs[i])
+        i += 1
+    }
+    out
+}
+
+/// The full chain: Hann window -> 4-tap moving-average FIR ->
+/// Butterworth lowpass biquad -> RMS / energy -> FFT magnitude peak.
+/// Every intermediate value is pinned by the oracle
+/// (`tools/vectors.json`, `demo_chain` / `demo_contract`).
+fn run_chain(frame: [Q15; 16]) -> ChainResult {
+    let windowed = window(samples: frame, coeffs: HANN16)
+    var ma = Fir::new(
+        taps: [
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+        ],
+    )
+    let fir_out = run_fir(fir: mut ma, xs: windowed)
+    var lp = Biquad::lowpass_01()
+    let bq_out = run_biquad(bq: mut lp, xs: fir_out)
+    let mag = fft_magnitude(x: fft16(x: to_cplx(xs: bq_out)))
+    var peak: i32 = mag[0].raw()
+    var bin: usize = 0
+    var i: usize = 1
+    while i < 16 {
+        if mag[i].raw() > peak {
+            peak = mag[i].raw()
+            bin = i
+        }
+        i += 1
+    }
+    ChainResult {
+        rms: rms(x: bq_out).raw(),
+        energy: energy(x: bq_out).raw(),
+        fft_peak: peak,
+        fft_peak_bin: bin as u256,
+    }
+}
+
+pub contract DspDemo {
+    recv DspDemoMsg {
+        RunDemo -> ChainResult {
+            var burst: [Q15; 16] = [Q15::zero(); 16]
+            var i: usize = 0
+            while i < 16 {
+                burst[i] = Q15::from_raw(raw: DEMO_BURST[i])
+                i += 1
+            }
+            run_chain(frame: burst)
+        }
+        RunChain { frame } -> ChainResult {
+            var input: [Q15; 16] = [Q15::zero(); 16]
+            var i: usize = 0
+            while i < 16 {
+                input[i] = Q15::from_raw(raw: frame[i])
+                i += 1
+            }
+            run_chain(frame: input)
+        }
+    }
+}
+
+#[test]
+fn test_dsp_demo() uses (evm: mut Evm) {
+    let addr = evm.create2<DspDemo>(value: Wei::zero(), args: (), salt: 0)
+    assert!(addr.word() != 0)
+
+    // The documented demo burst, no arguments: every value is pinned
+    // by the oracle (`demo_chain`).
+    let demo: ChainResult = evm
+        .call(
+            addr: addr,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: DspDemoMsg::RunDemo {},
+        )
+    assert!(demo.rms == 5477)
+    assert!(demo.energy == 14649)
+    assert!(demo.fft_peak == 42686)
+    assert!(demo.fft_peak_bin == 2)
+
+    // The same burst supplied as an argument must give the same result.
+    let chained: ChainResult = evm
+        .call(
+            addr: addr,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: DspDemoMsg::RunChain {
+                frame: [
+                    0,
+                    20853,
+                    29490,
+                    20853,
+                    0,
+                    -20853,
+                    -29490,
+                    -20853,
+                    0,
+                    20853,
+                    29490,
+                    20853,
+                    0,
+                    -20853,
+                    -29490,
+                    -20853,
+                ],
+            },
+        )
+    assert!(chained.rms == 5477)
+    assert!(chained.energy == 14649)
+    assert!(chained.fft_peak == 42686)
+    assert!(chained.fft_peak_bin == 2)
+
+    // A seeded random frame (seed 20261120, `demo_contract` in the
+    // oracle): the contract must agree with the library exactly.
+    let random: ChainResult = evm
+        .call(
+            addr: addr,
+            gas: 1000000,
+            value: Wei::zero(),
+            message: DspDemoMsg::RunChain {
+                frame: [
+                    -24645,
+                    1482,
+                    -25969,
+                    14945,
+                    -19155,
+                    12458,
+                    7317,
+                    158,
+                    -7751,
+                    -1769,
+                    -680,
+                    16984,
+                    -24544,
+                    1431,
+                    9182,
+                    -7741,
+                ],
+            },
+        )
+    assert!(random.rms == 552)
+    assert!(random.energy == 149)
+    assert!(random.fft_peak == 4934)
+    assert!(random.fft_peak_bin == 2)
+}
