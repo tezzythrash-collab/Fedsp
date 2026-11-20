@@ -1,0 +1,300 @@
+// FeDSP test suite.
+//
+// Every expected value below was computed by an independent Python oracle
+// (`tools/gen_vectors.py`, exact arbitrary-precision integer arithmetic),
+// not by copying Fe output. If a value here disagrees with Fe, the Fe
+// implementation or its documented semantics are wrong — not the vector.
+
+use ingot::{Q, Q7, Q15, Q31, HANN16, HANN32, HANN64, dot, window}
+
+fn sum_i32<const N: usize>(a: [i32; N]) -> i32 {
+    var s = 0
+    var i: usize = 0
+    while i < N {
+        s += a[i]
+        i += 1
+    }
+    s
+}
+
+#[test]
+fn conversions_from_int() {
+    assert!(Q15::from_int(x: 2).raw() == 65536)
+    assert!(Q15::from_int(x: -3).raw() == -98304)
+    assert!(Q15::from_int(x: 70000).raw() == 2147483647)
+    assert!(Q15::from_int(x: -70000).raw() == -2147483648)
+    assert!(Q31::from_int(x: 1).raw() == 2147483647)
+    assert!(Q31::from_int(x: -2).raw() == -2147483648)
+    assert!(Q7::from_int(x: 100).raw() == 12800)
+    assert!(Q15::from_int(x: 2).to_int() == 2)
+    assert!(Q15::from_int(x: -3).to_int() == -3)
+    // to_int floors for negatives: -1.5 -> -2
+    assert!(Q15::from_raw(raw: -49152).to_int() == -2)
+    assert!(Q15::from_raw(raw: 49152).to_int() == 1)
+}
+
+#[test]
+fn conversions_from_i64() {
+    assert!(Q15::from_i64(x: 70000).raw() == 2147483647)
+    assert!(Q15::from_i64(x: -70000).raw() == -2147483648)
+    assert!(Q15::from_i64(x: 42).raw() == 1376256)
+}
+
+#[test]
+fn conversions_from_ratio() {
+    assert!(Q15::from_ratio(num: 3, den: 4).raw() == 24576)
+    assert!(Q15::from_ratio(num: -1, den: 2).raw() == -16384)
+    assert!(Q15::from_ratio(num: 1, den: 3).raw() == 10923)
+    assert!(Q15::from_ratio(num: 2, den: 3).raw() == 21845)
+    assert!(Q15::from_ratio(num: 1, den: 0).raw() == 2147483647)
+    assert!(Q15::from_ratio(num: -1, den: 0).raw() == -2147483648)
+    assert!(Q15::from_ratio(num: 0, den: 0).raw() == 0)
+}
+
+#[test]
+fn constants() {
+    assert!(Q15::zero().raw() == 0)
+    assert!(Q15::one().raw() == 32768)
+    assert!(Q7::one().raw() == 128)
+    // Q31 cannot represent 1.0: one() saturates to maximum()
+    assert!(Q31::one().raw() == 2147483647)
+    assert!(Q15::maximum().raw() == 2147483647)
+    assert!(Q15::minimum().raw() == -2147483648)
+    assert!(Q15::zero().is_zero())
+    assert!(!Q15::one().is_zero())
+    assert!(Q15::from_raw(raw: -5).is_negative())
+    assert!(!Q15::from_raw(raw: 5).is_negative())
+}
+
+#[test]
+fn sat_add_sub() {
+    let max = Q15::maximum()
+    let min = Q15::minimum()
+    assert!(
+        max.sat_add(other: Q15::from_raw(raw: 1)).raw() == 2147483647,
+    )
+    assert!(
+        min.sat_add(other: Q15::from_raw(raw: -1)).raw() == -2147483648,
+    )
+    assert!(
+        Q15::from_raw(raw: -100).sat_add(other: Q15::from_raw(raw: 250)).raw() == 150,
+    )
+    assert!(
+        min.sat_sub(other: Q15::from_raw(raw: 1)).raw() == -2147483648,
+    )
+    assert!(
+        max.sat_sub(other: Q15::from_raw(raw: -1)).raw() == 2147483647,
+    )
+    assert!(
+        Q15::from_raw(raw: 100).sat_sub(other: Q15::from_raw(raw: 250)).raw() == -150,
+    )
+}
+
+#[test]
+fn sat_mul() {
+    let half = Q15::from_raw(raw: 16384)
+    let one = Q15::one()
+    assert!(half.sat_mul(other: half).raw() == 8192)
+    assert!(half.sat_neg().sat_mul(other: half).raw() == -8192)
+    assert!(one.sat_mul(other: one).raw() == 32768)
+    assert!(
+        Q15::maximum().sat_mul(other: Q15::maximum()).raw() == 2147483647,
+    )
+    assert!(
+        Q15::minimum().sat_mul(other: Q15::minimum()).raw() == 2147483647,
+    )
+    assert!(Q15::minimum().sat_mul(other: one).raw() == -2147483648)
+    // rounding ties: +0.5 ulp rounds up, -0.5 ulp rounds toward +inf (to 0)
+    assert!(Q15::from_raw(raw: 1).sat_mul(other: half).raw() == 1)
+    assert!(Q15::from_raw(raw: -1).sat_mul(other: half).raw() == 0)
+    assert!(Q15::from_raw(raw: -3).sat_mul(other: half).raw() == -1)
+    // (1/3) * 1.0 stays 1/3
+    assert!(
+        Q15::from_ratio(num: 1, den: 3).sat_mul(other: one).raw() == 10923,
+    )
+    // Q31: just-below-1.0 squared stays just below 1.0
+    assert!(
+        Q31::maximum().sat_mul(other: Q31::maximum()).raw() == 2147483646,
+    )
+}
+
+#[test]
+fn sat_div() {
+    let one = Q15::one()
+    let two = Q15::from_int(x: 2)
+    let three = Q15::from_int(x: 3)
+    assert!(one.sat_div(other: two).raw() == 16384)
+    assert!(three.sat_div(other: two).raw() == 49152)
+    assert!(one.sat_div(other: Q15::zero()).raw() == 2147483647)
+    assert!(
+        one.sat_neg().sat_div(other: Q15::zero()).raw() == -2147483648,
+    )
+    assert!(Q15::zero().sat_div(other: Q15::zero()).raw() == 0)
+    assert!(
+        Q15::maximum().sat_div(other: Q15::from_raw(raw: 16384)).raw() == 2147483647,
+    )
+    // truncates toward zero: -1.0 / 3.0 = -0.333.. -> -10922 (not -10923)
+    assert!(one.sat_neg().sat_div(other: three).raw() == -10922)
+}
+
+#[test]
+fn scale_and_shifts() {
+    let half = Q15::from_raw(raw: 16384)
+    assert!(half.scale(gain: Q15::from_raw(raw: 16384)).raw() == 8192)
+    assert!(half.scale_int(factor: 3).raw() == 49152)
+    assert!(Q15::maximum().scale_int(factor: 2).raw() == 2147483647)
+    assert!(half.shr(n: 1).raw() == 8192)
+    assert!(half.sat_neg().shr(n: 1).raw() == -8192)
+    assert!(half.shr(n: 40).raw() == 0)
+    assert!(half.sat_neg().shr(n: 40).raw() == -1)
+    assert!(half.shl_sat(n: 1).raw() == 32768)
+    assert!(Q15::maximum().shl_sat(n: 1).raw() == 2147483647)
+    assert!(half.sat_neg().shl_sat(n: 40).raw() == -2147483648)
+    assert!(Q15::zero().shl_sat(n: 40).raw() == 0)
+}
+
+#[test]
+fn abs_neg_clamp_min_max() {
+    assert!(Q15::minimum().abs().raw() == 2147483647)
+    assert!(Q15::from_raw(raw: -5).abs().raw() == 5)
+    assert!(Q15::minimum().sat_neg().raw() == 2147483647)
+    assert!(Q15::from_raw(raw: 5).sat_neg().raw() == -5)
+    let lo = Q15::from_raw(raw: -100)
+    let hi = Q15::from_raw(raw: 100)
+    assert!(
+        Q15::from_raw(raw: -500).clamp(lo: lo, hi: hi).raw() == -100,
+    )
+    assert!(Q15::from_raw(raw: 500).clamp(lo: lo, hi: hi).raw() == 100)
+    assert!(Q15::from_raw(raw: 42).clamp(lo: lo, hi: hi).raw() == 42)
+    assert!(
+        Q15::from_raw(raw: 3).min(other: Q15::from_raw(raw: 9)).raw() == 3,
+    )
+    assert!(
+        Q15::from_raw(raw: 3).max(other: Q15::from_raw(raw: 9)).raw() == 9,
+    )
+}
+
+#[test]
+fn hann_tables() {
+    assert!(HANN16[0] == 0)
+    assert!(HANN16[15] == 0)
+    assert!(HANN16[7] == 32409)
+    assert!(HANN16[1] == 1416)
+    assert!(HANN16[14] == 1416)
+    assert!(sum_i32(a: HANN16) == 245752)
+    assert!(HANN32[0] == 0)
+    assert!(HANN32[31] == 0)
+    assert!(HANN32[15] == 32683)
+    assert!(sum_i32(a: HANN32) == 507890)
+    assert!(HANN64[0] == 0)
+    assert!(HANN64[63] == 0)
+    assert!(HANN64[31] == 32747)
+    assert!(sum_i32(a: HANN64) == 1032158)
+}
+
+#[test]
+fn dot_products() {
+    let a4: [Q15; 4] = [
+        Q15::from_raw(raw: 11905),
+        Q15::from_raw(raw: -22704),
+        Q15::from_raw(raw: -28361),
+        Q15::from_raw(raw: 18598),
+    ]
+    let b4: [Q15; 4] = [
+        Q15::from_raw(raw: -11976),
+        Q15::from_raw(raw: -13951),
+        Q15::from_raw(raw: -15372),
+        Q15::from_raw(raw: -20856),
+    ]
+    assert!(dot(a: a4, b: b4).raw() == 6783)
+    let a16: [Q15; 16] = [
+        Q15::from_raw(raw: 18265),
+        Q15::from_raw(raw: -23283),
+        Q15::from_raw(raw: 14348),
+        Q15::from_raw(raw: 18540),
+        Q15::from_raw(raw: 28469),
+        Q15::from_raw(raw: 5741),
+        Q15::from_raw(raw: -24303),
+        Q15::from_raw(raw: 8698),
+        Q15::from_raw(raw: -2349),
+        Q15::from_raw(raw: -27918),
+        Q15::from_raw(raw: -28048),
+        Q15::from_raw(raw: -23860),
+        Q15::from_raw(raw: -15672),
+        Q15::from_raw(raw: -14753),
+        Q15::from_raw(raw: 3118),
+        Q15::from_raw(raw: 9453),
+    ]
+    let b16: [Q15; 16] = [
+        Q15::from_raw(raw: -28261),
+        Q15::from_raw(raw: 6781),
+        Q15::from_raw(raw: -16969),
+        Q15::from_raw(raw: 16925),
+        Q15::from_raw(raw: 12590),
+        Q15::from_raw(raw: 15962),
+        Q15::from_raw(raw: 5713),
+        Q15::from_raw(raw: -2507),
+        Q15::from_raw(raw: -15554),
+        Q15::from_raw(raw: -561),
+        Q15::from_raw(raw: 8618),
+        Q15::from_raw(raw: -11769),
+        Q15::from_raw(raw: 23046),
+        Q15::from_raw(raw: 26970),
+        Q15::from_raw(raw: -29575),
+        Q15::from_raw(raw: 19729),
+    ]
+    assert!(dot(a: a16, b: b16).raw() == -27094)
+    let unit: [Q15; 4] = [Q15::from_raw(raw: 16384); 4]
+    assert!(dot(a: unit, b: unit).raw() == 32768)
+}
+
+#[test]
+fn demo_gain_stage() {
+    // 16-sample sine burst, 2 cycles, amplitude 0.9 (Q15 raw).
+    let burst: [Q15; 16] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+    ]
+    // Step 1: Hann window. Spot-check + sum check against the oracle.
+    let windowed = window(samples: burst, coeffs: HANN16)
+    assert!(windowed[0].raw() == 0)
+    assert!(windowed[1].raw() == 901)
+    assert!(windowed[2].raw() == 4879)
+    assert!(windowed[7].raw() == -20625)
+    assert!(windowed[15].raw() == 0)
+    let ones: [Q15; 16] = [Q15::one(); 16]
+    assert!(dot(a: windowed, b: ones).raw() == -2183)
+    // Step 2: 0.5 gain via a second window pass with a flat 0.5 table.
+    let half_table: [i32; 16] = [16384; 16]
+    let gained = window(samples: windowed, coeffs: half_table)
+    assert!(gained[1].raw() == 451)
+    assert!(gained[6].raw() == -13336)
+    // Step 3: signal energy = dot(gained, gained).
+    assert!(dot(a: gained, b: gained).raw() == 18684)
+}
+
+#[test]
+fn q0_plain_integers() {
+    assert!(Q<0>::from_int(x: 5).raw() == 5)
+    assert!(Q<0>::from_int(x: 5).to_int() == 5)
+    assert!(
+        Q<0>::from_raw(raw: 3).sat_mul(other: Q<0>::from_raw(raw: 4)).raw() == 12,
+    )
+    assert!(
+        Q<0>::from_raw(raw: 7).sat_add(other: Q<0>::from_raw(raw: -2)).raw() == 5,
+    )
+}

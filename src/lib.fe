@@ -1,0 +1,427 @@
+//! FeDSP — fixed-point DSP math for Fe.
+//!
+//! Binary Q-format arithmetic on a signed 32-bit raw value: a `Q<FRAC>`
+//! stores the real value `raw / 2^FRAC`. Q15 (audio-rate workhorse) is the
+//! primary format; Q7 and Q31 are provided as aliases, and any `FRAC` in
+//! `0..=31` works.
+//!
+//! Design rules:
+//! - Every operation that can overflow **saturates** instead of wrapping
+//!   or reverting: add, sub, mul, div, conversions, shifts, abs, neg.
+//! - Multiplication widens to `i64`, rounds to nearest (ties toward +inf),
+//!   then clamps to `i32`. Division truncates toward zero.
+//! - Division by zero never reverts: it saturates to `MAX` / `MIN` by the
+//!   sign of the numerator (or `0` for `0 / 0`).
+//! - The library is pure: no storage, no EVM effects, no contracts. All
+//!   functions run under `fe test` on both the sonatina and native backends.
+//!
+//! Relation to the standard library: `core::fixed` provides **decimal**
+//! fixed-point (`Fixed<D>` = `raw / 10^D`, `Wad` / `Ray`) for money and
+//! DeFi. FeDSP provides **binary** Q-format (`raw / 2^FRAC`) for audio and
+//! signal processing, plus the DSP primitives the stdlib does not have:
+//! saturating arithmetic, scaling, shifts, Hann windows, dot products.
+//! The two are complementary, not duplicative.
+
+/// Binary Q-format fixed-point number: value = `raw / 2^FRAC`.
+///
+/// `FRAC` must be in `0..=31`, enforced at compile time by the `where`
+/// clause below: instantiating `Q` outside the range is a compile error.
+/// `Q<0>` is plain `i32` arithmetic;
+/// `Q<31>` spans (-1, 1) and its closest value to `1.0` is `maximum()`.
+pub struct Q<const FRAC: i32> where FRAC >= 0, FRAC <= 31 { raw: i32 }
+
+/// `Q` is a plain 32-bit value: copying it is always safe, and it is what
+/// lets fixed-size arrays of `Q` be built with repetition (`[Q15::zero(); N]`).
+impl<const FRAC: i32> Copy for Q<FRAC> {}
+
+impl<const FRAC: i32> Q<FRAC> {
+    /// Wrap a raw `i32` with no checks. Use for constants and test vectors.
+    pub fn from_raw(raw: i32) -> Self {
+        Self { raw }
+    }
+
+    /// The raw `i32` representation.
+    pub fn raw(self) -> i32 {
+        self.raw
+    }
+
+    /// Zero.
+    pub fn zero() -> Self {
+        Self { raw: 0 }
+    }
+
+    /// The closest representable value to `1.0`. For `FRAC <= 30` this is
+    /// exactly `1.0` (`1 << FRAC`); for `Q<31>`, `1.0` is not representable
+    /// and this saturates to `maximum()` (0.9999999995).
+    pub fn one() -> Self {
+        Self::from_int(x: 1)
+    }
+
+    /// Largest representable value (`raw == i32::MAX`).
+    pub fn maximum() -> Self {
+        Self { raw: 2147483647 }
+    }
+
+    /// Smallest representable value (`raw == i32::MIN`).
+    pub fn minimum() -> Self {
+        Self { raw: -2147483648 }
+    }
+
+    /// Convert an integer, saturating if it does not fit.
+    /// `from_int(x: 70000)` in Q15 saturates to `maximum()`.
+    pub fn from_int(x: i32) -> Self {
+        Self::from_i64(x: x as i64)
+    }
+
+    /// Convert a 64-bit integer, saturating if it does not fit.
+    pub fn from_i64(x: i64) -> Self {
+        let max_int: i64 = (2147483647 as i64) >> (FRAC as i64)
+        let min_int: i64 = -max_int - 1
+        if x > max_int {
+            Self::maximum()
+        } else if x < min_int {
+            Self::minimum()
+        } else {
+            Self { raw: (x << (FRAC as i64)).downcast_truncate() }
+        }
+    }
+
+    /// Integer part: arithmetic shift right (`raw >> FRAC`). Exact for
+    /// non-negative values; for negative values this floors, so the
+    /// integer part of -1.5 is -2, not -1.
+    pub fn to_int(self) -> i32 {
+        self.raw >> FRAC
+    }
+
+    /// Build from a rational `num / den`, rounding to nearest (ties away
+    /// from zero), saturating on overflow. A zero denominator never reverts:
+    /// it yields `maximum()` / `minimum()` by the sign of `num`, or zero
+    /// for `0 / 0`.
+    pub fn from_ratio(num: i32, den: i32) -> Self {
+        if den == 0 {
+            if num > 0 {
+                Self::maximum()
+            } else if num < 0 {
+                Self::minimum()
+            } else {
+                Self::zero()
+            }
+        } else {
+            let v: i64 = (num as i64) << (FRAC as i64)
+            let half: i64 = (den as i64).abs() / 2
+            let den64: i64 = den as i64
+            let rounded: i64 = if (v >= 0) == (den > 0) {
+                (v + half) / den64
+            } else {
+                (v - half) / den64
+            }
+            Self { raw: rounded.downcast_saturate() }
+        }
+    }
+
+    /// True when the value is exactly zero.
+    pub fn is_zero(self) -> bool {
+        self.raw == 0
+    }
+
+    /// True when the value is negative.
+    pub fn is_negative(self) -> bool {
+        self.raw < 0
+    }
+
+    /// Saturating addition: clamps to `maximum()` / `minimum()` on overflow.
+    pub fn sat_add(self, other: Self) -> Self {
+        Self { raw: self.raw.saturating_add(other.raw) }
+    }
+
+    /// Saturating subtraction: clamps to `maximum()` / `minimum()` on overflow.
+    pub fn sat_sub(self, other: Self) -> Self {
+        Self { raw: self.raw.saturating_sub(other.raw) }
+    }
+
+    /// Saturating multiplication, rounding to nearest (ties toward +inf).
+    /// Widens to `i64`, adds half an ulp, shifts, then clamps to `i32`.
+    pub fn sat_mul(self, other: Self) -> Self {
+        let v: i64 = (self.raw as i64) * (other.raw as i64)
+        if FRAC == 0 {
+            Self { raw: v.downcast_saturate() }
+        } else {
+            let half: i64 = 1 << ((FRAC as i64) - 1)
+            let shifted: i64 = (v + half) >> (FRAC as i64)
+            Self { raw: shifted.downcast_saturate() }
+        }
+    }
+
+    /// Saturating division, truncating toward zero. A zero divisor never
+    /// reverts: it yields `maximum()` / `minimum()` by the sign of `self`,
+    /// or zero for `0 / 0`.
+    pub fn sat_div(self, other: Self) -> Self {
+        if other.raw == 0 {
+            if self.raw > 0 {
+                Self::maximum()
+            } else if self.raw < 0 {
+                Self::minimum()
+            } else {
+                Self::zero()
+            }
+        } else {
+            let num: i64 = (self.raw as i64) << (FRAC as i64)
+            let q: i64 = num / (other.raw as i64)
+            Self { raw: q.downcast_saturate() }
+        }
+    }
+
+    /// Saturating negation: `sat_neg(minimum()) == maximum()`.
+    pub fn sat_neg(self) -> Self {
+        if self.raw == -2147483648 {
+            Self::maximum()
+        } else {
+            Self { raw: -self.raw }
+        }
+    }
+
+    /// Saturating absolute value: `abs(minimum()) == maximum()`.
+    pub fn abs(self) -> Self {
+        if self.raw == -2147483648 {
+            Self::maximum()
+        } else {
+            Self { raw: self.raw.abs() }
+        }
+    }
+
+    /// Multiply by a Q-format gain. Alias for `sat_mul`, named for DSP code.
+    pub fn scale(self, gain: Self) -> Self {
+        self.sat_mul(other: gain)
+    }
+
+    /// Multiply the value by a plain integer, saturating.
+    /// `Q15(0.5).scale_int(factor: 3) == Q15(1.5)`.
+    pub fn scale_int(self, factor: i32) -> Self {
+        let v: i64 = (self.raw as i64) * (factor as i64)
+        Self { raw: v.downcast_saturate() }
+    }
+
+    /// Saturating shift left by `n` bits. `n <= 0` returns `self`;
+    /// `n >= 32` saturates by sign (zero stays zero).
+    pub fn shl_sat(self, n: i32) -> Self {
+        if n <= 0 {
+            self
+        } else if n >= 32 {
+            if self.raw > 0 {
+                Self::maximum()
+            } else if self.raw < 0 {
+                Self::minimum()
+            } else {
+                Self::zero()
+            }
+        } else {
+            let v: i64 = (self.raw as i64) << (n as i64)
+            Self { raw: v.downcast_saturate() }
+        }
+    }
+
+    /// Arithmetic shift right by `n` bits (sign-extending). `n <= 0`
+    /// returns `self`; `n >= 31` yields `0` (non-negative) or `-1` (negative).
+    pub fn shr(self, n: i32) -> Self {
+        if n <= 0 {
+            self
+        } else if n >= 31 {
+            if self.raw < 0 {
+                Self { raw: -1 }
+            } else {
+                Self::zero()
+            }
+        } else {
+            Self { raw: self.raw >> n }
+        }
+    }
+
+    /// Clamp to [`lo`, `hi`]. Caller must ensure `lo <= hi`.
+    pub fn clamp(self, lo: Self, hi: Self) -> Self {
+        if self.raw < lo.raw {
+            lo
+        } else if self.raw > hi.raw { hi } else { self }
+    }
+
+    /// Smaller of the two values.
+    pub fn min(self, other: Self) -> Self {
+        if self.raw < other.raw { self } else { other }
+    }
+
+    /// Larger of the two values.
+    pub fn max(self, other: Self) -> Self {
+        if self.raw > other.raw { self } else { other }
+    }
+}
+
+/// Q7: 7 fractional bits. Range roughly (-256, 256), step 1/128.
+pub type Q7 = Q<7>
+
+/// Q15: 15 fractional bits. The audio-rate workhorse.
+/// Range (-65536, 65536), step 1/32768; `1.0 == 32768`.
+pub type Q15 = Q<15>
+
+/// Q31: 31 fractional bits. Range (-1, 1), step 1/2^31.
+/// `1.0` is not representable; use `maximum()` for the closest value.
+pub type Q31 = Q<31>
+
+/// Hann window coefficients, Q15 raw values, length 16.
+/// Generated by `tools/gen_vectors.py`:
+/// `round(0.5 * (1 - cos(2*pi*n/(N-1))) * 32767)`. Endpoints are 0,
+/// the table is symmetric, peak is 32409 (0.9891).
+pub const HANN16: [i32; 16] = [
+    0,
+    1416,
+    5421,
+    11321,
+    18096,
+    24575,
+    29638,
+    32409,
+    32409,
+    29638,
+    24575,
+    18096,
+    11321,
+    5421,
+    1416,
+    0,
+]
+
+/// Hann window coefficients, Q15 raw values, length 32. Peak 32683.
+pub const HANN32: [i32; 32] = [
+    0,
+    335,
+    1328,
+    2937,
+    5096,
+    7717,
+    10693,
+    13903,
+    17213,
+    20490,
+    23599,
+    26412,
+    28815,
+    30708,
+    32016,
+    32683,
+    32683,
+    32016,
+    30708,
+    28815,
+    26412,
+    23599,
+    20490,
+    17213,
+    13903,
+    10693,
+    7717,
+    5096,
+    2937,
+    1328,
+    335,
+    0,
+]
+
+/// Hann window coefficients, Q15 raw values, length 64. Peak 32747.
+pub const HANN64: [i32; 64] = [
+    0,
+    81,
+    325,
+    728,
+    1286,
+    1995,
+    2847,
+    3833,
+    4944,
+    6169,
+    7495,
+    8909,
+    10398,
+    11946,
+    13539,
+    15159,
+    16792,
+    18421,
+    20029,
+    21601,
+    23122,
+    24575,
+    25947,
+    27224,
+    28393,
+    29443,
+    30363,
+    31145,
+    31779,
+    32260,
+    32584,
+    32747,
+    32747,
+    32584,
+    32260,
+    31779,
+    31145,
+    30363,
+    29443,
+    28393,
+    27224,
+    25947,
+    24575,
+    23122,
+    21601,
+    20029,
+    18421,
+    16792,
+    15159,
+    13539,
+    11946,
+    10398,
+    8909,
+    7495,
+    6169,
+    4944,
+    3833,
+    2847,
+    1995,
+    1286,
+    728,
+    325,
+    81,
+    0,
+]
+
+/// Dot product of two Q-format vectors: `sum(a[i] * b[i])`.
+/// Accumulates in `i64` (no intermediate overflow for realistic lengths),
+/// rounds to nearest, then saturates to `i32`.
+pub fn dot<const FRAC: i32, const N: usize>(a: [Q<FRAC>; N], b: [Q<FRAC>; N]) -> Q<FRAC>
+where FRAC >= 0, FRAC <= 31
+{
+    var acc: i64 = 0
+    var i: usize = 0
+    while i < N {
+        acc += (a[i].raw() as i64) * (b[i].raw() as i64)
+        i += 1
+    }
+    if FRAC == 0 {
+        Q<FRAC>::from_raw(raw: acc.downcast_saturate())
+    } else {
+        let half: i64 = 1 << ((FRAC as i64) - 1)
+        let shifted: i64 = (acc + half) >> (FRAC as i64)
+        Q<FRAC>::from_raw(raw: shifted.downcast_saturate())
+    }
+}
+
+/// Apply a window to Q15 samples: `out[i] = samples[i] * coeffs[i]`
+/// (each coefficient is a Q15 raw value, e.g. from `HANN16`).
+/// Elementwise `sat_mul`, so no element can overflow.
+pub fn window<const N: usize>(samples: [Q15; N], coeffs: [i32; N]) -> [Q15; N] {
+    var out: [Q15; N] = [Q15::zero(); N]
+    var i: usize = 0
+    while i < N {
+        out[i] = samples[i].sat_mul(other: Q15::from_raw(raw: coeffs[i]))
+        i += 1
+    }
+    out
+}
