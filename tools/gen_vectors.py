@@ -15,10 +15,32 @@ Semantics mirrored exactly from src/lib.fe (documented there too):
   - from_ratio(num, den): (num << FRAC) / den with round-to-nearest
     (ties away from zero), den == 0 -> MAX/MIN/0 by sign of num.
   - Hann window: round(0.5 * (1 - cos(2*pi*n/(N-1))) * 32767), Q15 raw.
+  - dot (v0.2.0): i64 accumulation with saturation at every step
+    (clamp_i64 after each add), then round-to-nearest and clamp to i32.
+  - convert_q: Q<FROM> -> Q<TO> by shift, rounding to nearest
+    (ties toward +inf) when shifting right, saturating.
+  - biquad: transposed direct form II, one sat_mul/sat_add/sat_sub per
+    term, in the same order as Biquad::step.
+  - fir: delay-line shift, then the saturating dot.
+  - mean: saturating i64 sum, round-to-nearest division by N
+    (ties toward +inf). rms: saturating sum of squares, integer sqrt
+    of the mean, rounded to nearest. energy: dot(x, x).
+  - q_sqrt: isqrt(raw << FRAC), rounded to nearest; negative -> 0.
+  - q_reciprocal: Newton iteration (5 fixed steps) on the normalized
+    mantissa, mirroring Q::reciprocal step for step, with the same
+    saturation branches for 0, Q<0>, and Q<31>.
+  - differential (v0.4.0): seeded random inputs (seed 20261120,
+    consumed in the fixed order dot -> fir -> biquad -> fft -> scalars
+    -> demo-contract frame) through dot, FIR, biquad, FFT, sqrt,
+    reciprocal, and convert_q. Differential coverage on top of the
+    fixed vectors above, not a replacement: every expected value is
+    computed here, never copied from Fe output.
 
 Outputs:
   - tools/vectors.json : every vector used by the Fe tests.
   - tools/hann_tables.txt : Fe literals for HANN16/32/64.
+  - tools/window_tables.txt : Fe literals for HAMMING16/32/64 and
+    BLACKMAN16/32/64.
 Run: python3 tools/gen_vectors.py
 """
 import json
@@ -27,10 +49,37 @@ import random
 
 I32_MAX = 2**31 - 1
 I32_MIN = -(2**31)
+I64_MAX = 2**63 - 1
+I64_MIN = -(2**63)
 
 
 def clamp_i32(x):
     return max(I32_MIN, min(I32_MAX, x))
+
+
+def clamp_i64(x):
+    return max(I64_MIN, min(I64_MAX, x))
+
+
+def sat_add_i32(a, b):
+    return clamp_i32(a + b)
+
+
+def sat_sub_i32(a, b):
+    return clamp_i32(a - b)
+
+
+def isqrt_round(x):
+    """Integer square root, rounded to nearest (ties toward +inf).
+
+    Mirrors the Fe Newton iteration in src/lib.fe: floor sqrt, then round
+    up iff the remainder exceeds the root (r > s ⟺ M is closer to (s+1)^2).
+    """
+    if x <= 0:
+        return 0
+    s = math.isqrt(x)
+    r = x - s * s
+    return s + 1 if r > s else s
 
 
 def trunc_div(a, b):
@@ -50,6 +99,63 @@ def sat_div(a, b, frac):
     if b == 0:
         return I32_MAX if a > 0 else (I32_MIN if a < 0 else 0)
     return clamp_i32(trunc_div(a << frac, b))
+
+
+def convert_q(raw, frm, to):
+    """Q<FROM> raw -> Q<TO> raw, rounding to nearest (ties toward +inf),
+    saturating. Mirrors convert_q in src/lib.fe exactly."""
+    if frm == to:
+        return clamp_i32(raw)
+    if frm > to:
+        d = frm - to
+        return clamp_i32((raw + (1 << (d - 1))) >> d)
+    return clamp_i32(raw << (to - frm))
+
+
+def q_sqrt(raw, frac):
+    """Q<FRAC> square root, raw in -> raw out, via integer sqrt of
+    raw << FRAC, rounded to nearest. Negative input -> 0.
+    Mirrors Q::sqrt in src/lib.fe."""
+    if raw <= 0:
+        return 0
+    return clamp_i32(isqrt_round(raw << frac))
+
+
+def q_reciprocal(raw, frac):
+    """Q<FRAC> reciprocal, raw in -> raw out, by Newton iteration.
+    Mirrors Q::reciprocal in src/lib.fe step for step, including the
+    5 fixed iterations, the normalization, and the saturation branches."""
+    if raw == 0:
+        return I32_MAX
+    if frac == 0:
+        return raw if raw in (1, -1) else 0
+    if frac >= 31:
+        return I32_MIN if raw < 0 else I32_MAX
+    # Normalize |raw| into [2**(frac-1), 2**frac) by shifting.
+    m = abs(raw)
+    k = 0
+    lo = 1 << (frac - 1)
+    hi = 1 << frac
+    while m < lo:
+        m <<= 1
+        k += 1
+    while m >= hi:
+        m >>= 1
+        k -= 1
+    one = 1 << frac
+    y = from_ratio(3, 2, frac)  # 1.5, exact
+    for _ in range(5):
+        prod = sat_mul(m, y, frac)          # x' * y
+        one_minus = sat_sub_i32(one, prod)  # 1 - x' * y
+        y = sat_add_i32(y, sat_mul(y, one_minus, frac))
+    if k >= 0:
+        y_raw = clamp_i32(y << k)
+    else:
+        d = -k
+        y_raw = clamp_i32((y + (1 << (d - 1))) >> d)
+    if raw < 0:
+        y_raw = I32_MAX if y_raw == I32_MIN else -y_raw  # sat_neg
+    return y_raw
 
 
 def from_int(x, frac):
@@ -81,11 +187,226 @@ def hann(n_points):
     ]
 
 
+def hamming(n_points):
+    return [
+        int(round((0.54 - 0.46 * math.cos(2.0 * math.pi * n / (n_points - 1))) * 32767))
+        for n in range(n_points)
+    ]
+
+
+def blackman(n_points):
+    return [
+        int(round((0.42 - 0.5 * math.cos(2.0 * math.pi * n / (n_points - 1))
+                   + 0.08 * math.cos(4.0 * math.pi * n / (n_points - 1))) * 32767))
+        for n in range(n_points)
+    ]
+
+
 def dot(a, b, frac):
-    acc = sum(x * y for x, y in zip(a, b))
+    """Saturating dot product: i64 accumulation with saturation at every
+    step, then round-to-nearest (ties toward +inf) and clamp to i32.
+    Mirrors dot in src/lib.fe exactly (v0.2.0 fix: the accumulator used
+    to be a plain i64 add, which reverted on overflow)."""
+    acc = 0
+    for x, y in zip(a, b):
+        acc = clamp_i64(acc + x * y)
     if frac >= 1:
-        acc = (acc + (1 << (frac - 1))) >> frac
+        acc = clamp_i64(acc + (1 << (frac - 1))) >> frac
     return clamp_i32(acc)
+
+
+def mean_py(vals):
+    """Mean of Q15 raws, rounding to nearest (ties toward +inf),
+    saturating. Mirrors mean in src/lib.fe."""
+    acc = 0
+    for v in vals:
+        acc = clamp_i64(acc + v)
+    n = len(vals)
+    q = trunc_div(acc, n)
+    rem = acc - q * n
+    # Round to nearest, ties toward +inf (same convention as sat_mul).
+    # Positive: round up iff 2*rem >= n, i.e. rem >= (n+1)//2.
+    # Negative: round down iff 2*(-rem) > n, i.e. -rem >= n//2 + 1
+    # (a tie at exactly -0.5 rounds toward +inf, i.e. stays at q).
+    if acc >= 0:
+        if rem >= (n + 1) // 2:
+            q += 1
+    else:
+        if rem <= -(n // 2 + 1):
+            q -= 1
+    return clamp_i32(q)
+
+
+def rms_py(vals):
+    """RMS of Q15 raws: sqrt of the mean of squares, rounded to nearest.
+    Mirrors rms in src/lib.fe."""
+    acc = 0
+    for v in vals:
+        acc = clamp_i64(acc + v * v)
+    m = acc // len(vals)  # acc >= 0, trunc == floor
+    return clamp_i32(isqrt_round(m))
+
+
+def biquad_coeffs_lowpass_01():
+    """2nd-order Butterworth lowpass, fc = 0.1 * fs, Q15 raw coeffs
+    (b0, b1, b2, a1, a2). Standard RBJ/Butterworth design."""
+    omega = 2.0 * math.pi * 0.1
+    k = math.tan(omega / 2.0)
+    norm = 1.0 / (1.0 + math.sqrt(2.0) * k + k * k)
+    b0 = k * k * norm
+    b1 = 2.0 * b0
+    b2 = b0
+    a1 = 2.0 * (k * k - 1.0) * norm
+    a2 = (1.0 - math.sqrt(2.0) * k + k * k) * norm
+    return [int(round(c * 32768)) for c in (b0, b1, b2, a1, a2)]
+
+
+def biquad_step(state, coeffs, x):
+    """One transposed-direct-form-II step, mirroring Biquad::step.
+    state = (z1, z2) Q15 raws; returns ((z1', z2'), y)."""
+    b0, b1, b2, a1, a2 = coeffs
+    z1, z2 = state
+    y = sat_add_i32(sat_mul(b0, x, 15), z1)
+    z1n = sat_add_i32(sat_sub_i32(sat_mul(b1, x, 15), sat_mul(a1, y, 15)), z2)
+    z2n = sat_sub_i32(sat_mul(b2, x, 15), sat_mul(a2, y, 15))
+    return (z1n, z2n), y
+
+
+def biquad_run(coeffs, xs):
+    state = (0, 0)
+    ys = []
+    for x in xs:
+        state, y = biquad_step(state, coeffs, x)
+        ys.append(y)
+    return ys
+
+
+def fir_step(taps, delay, x):
+    """One FIR step, mirroring Fir::step: shift the delay line, then dot.
+    Returns (new delay, y)."""
+    d = [x] + delay[:-1]
+    return d, dot(taps, d, 15)
+
+
+def fir_run(taps, xs):
+    delay = [0] * len(taps)
+    ys = []
+    for x in xs:
+        delay, y = fir_step(taps, delay, x)
+        ys.append(y)
+    return ys
+
+
+def sat_neg(x):
+    """Saturating negation of an i32 raw, mirroring Q::sat_neg."""
+    return I32_MAX if x == I32_MIN else -x
+
+
+def twiddles(n):
+    """FFT twiddle factors W_n^k = exp(-2*pi*i*k/n), Q15 raw.
+    Real part: round(cos(2*pi*k/n) * 32768); imaginary part:
+    round(-sin(2*pi*k/n) * 32768). Mirrors the TWIDDLE tables in
+    src/lib.fe (Q15::one() is 32768, so cos(0) is exactly 32768)."""
+    re = [clamp_i32(int(round(math.cos(2.0 * math.pi * k / n) * 32768)))
+          for k in range(n)]
+    im = [clamp_i32(int(round(-math.sin(2.0 * math.pi * k / n) * 32768)))
+          for k in range(n)]
+    return re, im
+
+
+def bitrev(n):
+    """Bit-reversal permutation for a radix-2 FFT of size n."""
+    log = n.bit_length() - 1
+    out = []
+    for i in range(n):
+        r = 0
+        for b in range(log):
+            if (i >> b) & 1:
+                r |= 1 << (log - 1 - b)
+        out.append(r)
+    return out
+
+
+def cplx_mul(a, b):
+    """Complex Q15 multiply, mirroring Cplx::mul: (ac-bd) + (ad+bc)i,
+    each product a sat_mul, each sum/difference saturating."""
+    re = sat_sub_i32(sat_mul(a[0], b[0], 15), sat_mul(a[1], b[1], 15))
+    im = sat_add_i32(sat_mul(a[0], b[1], 15), sat_mul(a[1], b[0], 15))
+    return (re, im)
+
+
+def fft_mirror(xs, tw_re, tw_im, rev):
+    """Iterative radix-2 DIT FFT, mirroring fft_core in src/lib.fe
+    step for step: bit-reversal permutation, then log2(n) stages of
+    butterflies with the same twiddle indexing (j * n/len) and the
+    same saturating adds/subs."""
+    n = len(xs)
+    a = [xs[rev[i]] for i in range(n)]
+    length = 2
+    while length <= n:
+        half = length // 2
+        step = n // length
+        base = 0
+        while base < n:
+            for j in range(half):
+                w = (tw_re[j * step], tw_im[j * step])
+                t = cplx_mul(w, a[base + j + half])
+                u = a[base + j]
+                a[base + j] = (sat_add_i32(u[0], t[0]),
+                               sat_add_i32(u[1], t[1]))
+                a[base + j + half] = (sat_sub_i32(u[0], t[0]),
+                                      sat_sub_i32(u[1], t[1]))
+            base += length
+        length *= 2
+    return a
+
+
+def dft_float(xs):
+    """Reference DFT in floating point (independent of the butterfly
+    algorithm): X[k] = sum_n x[n] * exp(-2*pi*i*k*n/N), rounded to
+    nearest integer. The mirrored FFT must agree with this within a
+    small tolerance (a few ulp per component, growing with log2 N);
+    a wrong algorithm would be off by orders of magnitude more."""
+    import cmath
+    n = len(xs)
+    out = []
+    for k in range(n):
+        s = 0j
+        for t, (re, im) in enumerate(xs):
+            s += complex(re, im) * cmath.exp(-2j * math.pi * k * t / n)
+        out.append((int(round(s.real)), int(round(s.imag))))
+    return out
+
+
+def div_pow2_round(x, s):
+    """Divide an i32 raw by 2**s, rounding to nearest (ties toward
+    +inf), saturating. Mirrors div_pow2_round in src/lib.fe (the
+    inverse-FFT scale by 1/N)."""
+    if s <= 0:
+        return clamp_i32(x)
+    return clamp_i32((x + (1 << (s - 1))) >> s)
+
+
+def ifft_mirror(xs, tw_re, tw_im, rev):
+    """Inverse FFT by the conjugate trick, mirroring ifft_core:
+    conj -> fft -> conj -> scale by 1/N with div_pow2_round."""
+    n = len(xs)
+    log = n.bit_length() - 1
+    conj = [(re, sat_neg(im)) for re, im in xs]
+    f = fft_mirror(conj, tw_re, tw_im, rev)
+    return [(div_pow2_round(re, log), div_pow2_round(sat_neg(im), log))
+            for re, im in f]
+
+
+def cplx_magnitude(re, im):
+    """|re + i*im| in Q15, mirroring Cplx::magnitude: sqrt of the
+    saturating sum of the squared components."""
+    return q_sqrt(sat_add_i32(sat_mul(re, re, 15), sat_mul(im, im, 15)), 15)
+
+
+def sum_sq(xs):
+    """Sum of |x|^2 over a complex frame, exact Python ints."""
+    return sum(re * re + im * im for re, im in xs)
 
 
 def main():
@@ -218,6 +539,370 @@ def main():
         "windowed_sum": sum(windowed),
     }
 
+    # --- dot saturation (v0.2.0 regression) --------------------------------
+    # 3 max-magnitude elements used to revert (i64 accumulator overflow);
+    # saturating accumulation must return MAX / MIN instead.
+    v["dot_sat"] = {
+        "max3": dot([I32_MAX] * 3, [I32_MAX] * 3, 15),
+        "min3": dot([I32_MIN] * 3, [I32_MIN] * 3, 15),
+        "max_min3": dot([I32_MAX] * 3, [I32_MIN] * 3, 15),
+        "min_max3": dot([I32_MIN] * 3, [I32_MAX] * 3, 15),
+        "max8": dot([I32_MAX] * 8, [I32_MAX] * 8, 15),
+        "min8": dot([I32_MIN] * 8, [I32_MIN] * 8, 15),
+        "mixed": dot([I32_MAX, I32_MIN, 16384, -16384],
+                     [16384, -16384, I32_MAX, I32_MIN], 15),
+    }
+
+    # --- format conversion ---------------------------------------------------
+    v["convert_q"] = {
+        "q15_half_to_q31": convert_q(16384, 15, 31),
+        "q15_half_to_q7": convert_q(16384, 15, 7),
+        "q7_one_to_q15": convert_q(128, 7, 15),
+        "q31_max_to_q15": convert_q(I32_MAX, 31, 15),
+        "q31_min_to_q15": convert_q(I32_MIN, 31, 15),
+        "q15_max_to_q7": convert_q(I32_MAX, 15, 7),
+        "q15_one_to_q7": convert_q(32768, 15, 7),
+        "q15_raw1_to_q7": convert_q(1, 15, 7),
+        "q15_raw128_to_q7": convert_q(128, 15, 7),
+        "q15_neg128_to_q7": convert_q(-128, 15, 7),
+        "q15_neg129_to_q7": convert_q(-129, 15, 7),
+        "q15_neg1_to_q7": convert_q(-1, 15, 7),
+        "q0_5_to_q15": convert_q(5, 0, 15),
+        "q15_5_to_q0": convert_q(163840, 15, 0),
+        "q15_neg_to_q0": convert_q(-49152, 15, 0),
+        "q0_1_to_q31": convert_q(1, 0, 31),
+        "q31_oneish_to_q0": convert_q(I32_MAX, 31, 0),
+        "q31_neg_to_q0": convert_q(I32_MIN, 31, 0),
+        "q15_to_q15": convert_q(-12345, 15, 15),
+    }
+
+    # --- Hamming / Blackman tables --------------------------------------------
+    ham = {n: hamming(n) for n in (16, 32, 64)}
+    blk = {n: blackman(n) for n in (16, 32, 64)}
+    v["hamming"] = {f"hamming{n}": t for n, t in ham.items()}
+    v["blackman"] = {f"blackman{n}": t for n, t in blk.items()}
+    v["window_props"] = {
+        "hamming16_sum": sum(ham[16]), "hamming32_sum": sum(ham[32]),
+        "hamming64_sum": sum(ham[64]),
+        "hamming16_peak": max(ham[16]), "hamming32_peak": max(ham[32]),
+        "hamming64_peak": max(ham[64]),
+        "hamming16_end": ham[16][0], "hamming16_mid": ham[16][8],
+        "blackman16_sum": sum(blk[16]), "blackman32_sum": sum(blk[32]),
+        "blackman64_sum": sum(blk[64]),
+        "blackman16_peak": max(blk[16]), "blackman32_peak": max(blk[32]),
+        "blackman64_peak": max(blk[64]),
+        "blackman16_end": blk[16][0], "blackman16_mid": blk[16][8],
+    }
+
+    # --- mean / rms / energy ---------------------------------------------------
+    demo_frame = burst  # the demo sine burst, reused as a frame
+    const_frame = [16384] * 16
+    v["frame_stats"] = {
+        "burst_mean": mean_py(demo_frame),
+        "burst_rms": rms_py(demo_frame),
+        "burst_energy": dot(demo_frame, demo_frame, 15),
+        "const_mean": mean_py(const_frame),
+        "const_rms": rms_py(const_frame),
+        "const_energy": dot(const_frame, const_frame, 15),
+        "mean_1_2": mean_py([1, 2]),
+        "mean_neg1_neg2": mean_py([-1, -2]),
+        "mean_max_pair": mean_py([I32_MAX, I32_MAX]),
+        "mean_min_pair": mean_py([I32_MIN, I32_MIN]),
+        "mean_max_min": mean_py([I32_MAX, I32_MIN]),
+        "rms_half_zero": rms_py([16384, 0, 0, 0]),
+        "rms_full": rms_py([32768, 32768, 32768, 32768]),
+        "rms_min": rms_py([I32_MIN]),
+        "rms_zero": rms_py([0, 0, 0, 0]),
+        "energy_unit": dot([16384] * 4, [16384] * 4, 15),
+    }
+
+    # --- sqrt / reciprocal ------------------------------------------------------
+    v["sqrt"] = {
+        "q15_one": q_sqrt(32768, 15),
+        "q15_quarter": q_sqrt(8192, 15),
+        "q15_half": q_sqrt(16384, 15),
+        "q15_two": q_sqrt(65536, 15),
+        "q15_four": q_sqrt(131072, 15),
+        "q15_zero": q_sqrt(0, 15),
+        "q15_neg": q_sqrt(-32768, 15),
+        "q15_009": q_sqrt(2949, 15),
+        "q15_max": q_sqrt(I32_MAX, 15),
+        "q31_max": q_sqrt(I32_MAX, 31),
+        "q31_half": q_sqrt(1073741824, 31),
+        "q7_four": q_sqrt(512, 7),
+        "q7_two": q_sqrt(256, 7),
+        "q0_16": q_sqrt(16, 0),
+        "q0_2": q_sqrt(2, 0),
+        "q0_0": q_sqrt(0, 0),
+    }
+    v["reciprocal"] = {
+        "q15_one": q_reciprocal(32768, 15),
+        "q15_half": q_reciprocal(16384, 15),
+        "q15_two": q_reciprocal(65536, 15),
+        "q15_zero": q_reciprocal(0, 15),
+        "q15_neg2": q_reciprocal(-65536, 15),
+        "q15_third": q_reciprocal(10923, 15),
+        "q15_three": q_reciprocal(98304, 15),
+        "q15_quarter": q_reciprocal(8192, 15),
+        "q15_raw1": q_reciprocal(1, 15),
+        "q15_raw2": q_reciprocal(2, 15),
+        "q15_raw7": q_reciprocal(7, 15),
+        "q15_max": q_reciprocal(I32_MAX, 15),
+        "q15_min": q_reciprocal(I32_MIN, 15),
+        "q15_neg1": q_reciprocal(-1, 15),
+        "q7_two": q_reciprocal(256, 7),
+        "q7_half": q_reciprocal(64, 7),
+        "q7_one": q_reciprocal(128, 7),
+        "q31_max": q_reciprocal(I32_MAX, 31),
+        "q31_min": q_reciprocal(I32_MIN, 31),
+        "q31_half": q_reciprocal(1073741824, 31),
+        "q0_5": q_reciprocal(5, 0),
+        "q0_1": q_reciprocal(1, 0),
+        "q0_neg1": q_reciprocal(-1, 0),
+        "q0_0": q_reciprocal(0, 0),
+    }
+
+    # --- biquad (Butterworth lowpass, fc = 0.1 fs) ------------------------------
+    lp = biquad_coeffs_lowpass_01()
+    v["biquad"] = {
+        "lp_coeffs": lp,
+        "impulse8": biquad_run(lp, [32768] + [0] * 7),
+        "step16": biquad_run(lp, [32768] * 16),
+        "step16_last": biquad_run(lp, [32768] * 16)[-1],
+        "gain_half_impulse": biquad_run([16384, 0, 0, 0, 0], [16384, 0, 0, 0]),
+        "gain_half_step": biquad_run([16384, 0, 0, 0, 0], [16384] * 4),
+    }
+
+    # --- FIR ---------------------------------------------------------------------
+    rng7 = random.Random(7)
+    fir_taps = [rng7.randint(-30000, 30000) for _ in range(8)]
+    ma4 = [8192, 8192, 8192, 8192]
+    v["fir"] = {
+        "taps8": fir_taps,
+        "taps8_impulse": fir_run(fir_taps, [32768] + [0] * 9),
+        "taps8_step": fir_run(fir_taps, [32768] * 10),
+        "ma4_impulse": fir_run(ma4, [32768] + [0] * 5),
+        "ma4_step": fir_run(ma4, [32768] * 6),
+        "ma4_const": fir_run(ma4, [16384] * 6),
+    }
+
+    # --- FFT (v0.3.0) ---------------------------------------------------------
+    # Twiddle + bit-reversal tables, and FFT vectors for 16/32/64.
+    # Cross-checks (fail loudly at generation time if violated):
+    #   * the mirrored butterfly agrees with an independent float DFT
+    #     within 16 ulp per component (observed max: 11 at N=64);
+    #   * forward-then-inverse round-trips return the input within 2 ulp
+    #     (observed max: 1);
+    #   * Parseval: sum |X|^2 == N * sum |x|^2 within the bound below
+    #     (observed diffs printed; bound set with headroom).
+    fft_tw = {n: twiddles(n) for n in (16, 32, 64)}
+    fft_rev = {n: bitrev(n) for n in (16, 32, 64)}
+    v["fft_twiddle"] = {
+        f"tw{n}_re": fft_tw[n][0] for n in (16, 32, 64)
+    }
+    v["fft_twiddle"].update({
+        f"tw{n}_im": fft_tw[n][1] for n in (16, 32, 64)
+    })
+    v["fft_bitrev"] = {f"bitrev{n}": fft_rev[n] for n in (16, 32, 64)}
+
+    fft_inputs = {}
+    for n in (16, 32, 64):
+        impulse = [(32768, 0)] + [(0, 0)] * (n - 1)
+        dc = [(32768, 0)] * n
+        sine1 = [(int(round(math.sin(2.0 * math.pi * t / n) * 32767 * 0.9)), 0)
+                 for t in range(n)]
+        sine2 = [(int(round(math.sin(2.0 * math.pi * 2 * t / n) * 32767 * 0.9)), 0)
+                 for t in range(n)]
+        rng99 = random.Random(99)
+        rnd = [(rng99.randint(-30000, 30000), rng99.randint(-30000, 30000))
+               for _ in range(n)]
+        fft_inputs[n] = {"impulse": impulse, "dc": dc, "sine1": sine1,
+                         "sine2": sine2, "random": rnd}
+
+    v["fft"] = {}
+    parseval_diffs = {}
+    for n in (16, 32, 64):
+        tw_re, tw_im = fft_tw[n]
+        rev = fft_rev[n]
+        for name, xs in fft_inputs[n].items():
+            m = fft_mirror(xs, tw_re, tw_im, rev)
+            d = dft_float(xs)
+            err = max(max(abs(mr - dr), abs(mi - di))
+                      for (mr, mi), (dr, di) in zip(m, d))
+            assert err <= 16, f"fft n={n} {name}: mirror vs float DFT err {err} > 16"
+            rt = ifft_mirror(m, tw_re, tw_im, rev)
+            rt_err = max(max(abs(a - c), abs(b - dd))
+                         for (a, b), (c, dd) in zip(rt, xs))
+            assert rt_err <= 2, f"fft n={n} {name}: round-trip err {rt_err} > 2"
+            tsum = sum_sq(xs)
+            fsum = sum_sq(m)
+            pdiff = abs(fsum - n * tsum)
+            parseval_diffs[f"n{n}_{name}"] = pdiff
+            v["fft"][f"n{n}_{name}"] = {
+                "input_re": [re for re, _ in xs],
+                "input_im": [im for _, im in xs],
+                "out_re": [re for re, _ in m],
+                "out_im": [im for _, im in m],
+                "magnitude": [cplx_magnitude(re, im) for re, im in m],
+                "roundtrip_re": [re for re, _ in rt],
+                "roundtrip_im": [im for _, im in rt],
+                "roundtrip_err": rt_err,
+                "dft_err": err,
+                "time_sq_sum": tsum,
+                "freq_sq_sum": fsum,
+                "parseval_diff": pdiff,
+            }
+    print("fft mirror-vs-DFT max err:",
+          max(v["fft"][k]["dft_err"] for k in v["fft"]))
+    print("fft round-trip max err:",
+          max(v["fft"][k]["roundtrip_err"] for k in v["fft"]))
+    print("fft parseval diffs:", parseval_diffs)
+
+    # --- Cplx unit values (v0.3.0) ---------------------------------------------
+    half_c = (16384, 16384)  # 0.5 + 0.5i
+    v["cplx"] = {
+        "half_sq": cplx_mul(half_c, half_c),          # (0.5+0.5i)^2 = 0 + 0.5i
+        "half_conj": (16384, sat_neg(16384)),
+        "mag_0608": cplx_magnitude(19661, 26214),     # |0.6 + 0.8i| = 1.0
+        "mag_sq_half": sat_add_i32(sat_mul(16384, 16384, 15),
+                                   sat_mul(16384, 16384, 15)),  # 0.5
+        "mag_one": cplx_magnitude(32768, 0),
+        "mag_zero": cplx_magnitude(0, 0),
+        "add": (sat_add_i32(16384, 8192), sat_add_i32(-16384, 16384)),
+        "sub": (sat_sub_i32(16384, 8192), sat_sub_i32(-16384, 16384)),
+        "neg_conj_min": sat_neg(I32_MIN),             # conj of MIN im -> MAX
+    }
+
+    # --- demo signal chain (v0.3.0) -------------------------------------------
+    # Sine burst -> Hann window -> 4-tap moving-average FIR ->
+    # Butterworth lowpass biquad -> RMS/energy -> FFT magnitude.
+    ma4_chain = [8192, 8192, 8192, 8192]
+    fir_out = fir_run(ma4_chain, windowed)
+    bq_out = biquad_run(lp, fir_out)
+    spec = fft_mirror([(x, 0) for x in bq_out],
+                      fft_tw[16][0], fft_tw[16][1], fft_rev[16])
+    spec_mag = [cplx_magnitude(re, im) for re, im in spec]
+    v["demo_chain"] = {
+        "fir_out": fir_out,
+        "bq_out": bq_out,
+        "rms": rms_py(bq_out),
+        "energy": dot(bq_out, bq_out, 15),
+        "fft_re": [re for re, _ in spec],
+        "fft_im": [im for _, im in spec],
+        "fft_mag": spec_mag,
+    }
+
+    # --- randomized differential tests (v0.4.0) ---------------------------
+    # Seeded deterministic RNG: seed 20261120, consumed in the fixed
+    # order dot -> fir -> biquad -> fft -> scalars -> demo-contract
+    # frame, so re-running this script regenerates byte-identical
+    # vectors. Differential coverage on top of the fixed vectors above:
+    # random inputs through the same functions, with every expected
+    # value computed here, never copied from Fe output.
+    drng = random.Random(20261120)
+
+    # dot: 4 random 8-length pairs + 2 random 16-length pairs.
+    dot_rand = []
+    for _ in range(4):
+        a = [drng.randint(-30000, 30000) for _ in range(8)]
+        b = [drng.randint(-30000, 30000) for _ in range(8)]
+        dot_rand.append({"a": a, "b": b, "out": dot(a, b, 15)})
+    for _ in range(2):
+        a = [drng.randint(-30000, 30000) for _ in range(16)]
+        b = [drng.randint(-30000, 30000) for _ in range(16)]
+        dot_rand.append({"a": a, "b": b, "out": dot(a, b, 15)})
+
+    # FIR: random 8 taps + random 16-sample input.
+    fir_taps_r = [drng.randint(-30000, 30000) for _ in range(8)]
+    fir_in_r = [drng.randint(-30000, 30000) for _ in range(16)]
+    fir_out_r = fir_run(fir_taps_r, fir_in_r)
+
+    # biquad: random 16-sample input through the documented lowpass.
+    bq_in_r = [drng.randint(-30000, 30000) for _ in range(16)]
+    bq_out_r = biquad_run(lp, bq_in_r)
+
+    # FFT: random complex frames, 16 and 32 points. Same cross-checks
+    # as the fixed FFT vectors: mirrored butterfly vs independent
+    # float DFT (<= 16 ulp), forward-then-inverse round-trip (<= 2 ulp).
+    fft_rand = {}
+    for n in (16, 32):
+        xs = [(drng.randint(-30000, 30000), drng.randint(-30000, 30000))
+              for _ in range(n)]
+        tw_re, tw_im = fft_tw[n]
+        rev = fft_rev[n]
+        m = fft_mirror(xs, tw_re, tw_im, rev)
+        d = dft_float(xs)
+        err = max(max(abs(mr - dr), abs(mi - di))
+                  for (mr, mi), (dr, di) in zip(m, d))
+        assert err <= 16, f"fft random n={n}: mirror vs float DFT err {err} > 16"
+        rt = ifft_mirror(m, tw_re, tw_im, rev)
+        rt_err = max(max(abs(a - c), abs(b - dd))
+                     for (a, b), (c, dd) in zip(rt, xs))
+        assert rt_err <= 2, f"fft random n={n}: round-trip err {rt_err} > 2"
+        fft_rand[f"n{n}"] = {
+            "in_re": [re for re, _ in xs],
+            "in_im": [im for _, im in xs],
+            "out_re": [re for re, _ in m],
+            "out_im": [im for _, im in m],
+            "magnitude": [cplx_magnitude(re, im) for re, im in m],
+            "roundtrip_re": [re for re, _ in rt],
+            "roundtrip_im": [im for _, im in rt],
+            "dft_err": err,
+            "roundtrip_err": rt_err,
+            "time_sq_sum": sum_sq(xs),
+            "freq_sq_sum": sum_sq(m),
+        }
+
+    # scalars: 16 random raws for sqrt/reciprocal (10 in audio range,
+    # 3 near zero, 2 near the i32 extremes, 1 exactly), plus convert_q
+    # over 6 format pairs for the first 10 raws.
+    scal_r = []
+    for _ in range(10):
+        scal_r.append(drng.randint(-30000, 30000))
+    for _ in range(3):
+        scal_r.append(drng.randint(-100, 100))
+    scal_r.append(drng.randint(I32_MIN // 2, I32_MAX // 2))
+    scal_r.append(drng.randint(-I32_MAX, I32_MAX))
+    scal_r.append(1)
+    scal_pairs = [(15, 7), (15, 31), (7, 15), (31, 15), (15, 0), (0, 15)]
+    conv_r = []
+    for raw in scal_r[:10]:
+        for frm, to in scal_pairs:
+            conv_r.append({"raw": raw, "from": frm, "to": to, "out": convert_q(raw, frm, to)})
+
+    # demo-contract frame: a random 16-sample frame run through the full
+    # demo chain (Hann window -> 4-tap MA FIR -> Butterworth biquad ->
+    # RMS/energy -> FFT magnitude), for the DspDemo contract test.
+    dc_frame = [drng.randint(-30000, 30000) for _ in range(16)]
+    dc_windowed = [sat_mul(x, w, 15) for x, w in zip(dc_frame, tables[16])]
+    dc_fir = fir_run(ma4_chain, dc_windowed)
+    dc_bq = biquad_run(lp, dc_fir)
+    dc_spec = fft_mirror([(x, 0) for x in dc_bq],
+                         fft_tw[16][0], fft_tw[16][1], fft_rev[16])
+    dc_mag = [cplx_magnitude(re, im) for re, im in dc_spec]
+    dc_peak = max(dc_mag)
+    dc_bin = dc_mag.index(dc_peak)
+
+    v["differential"] = {
+        "seed": 20261120,
+        "dot": dot_rand,
+        "fir": {"taps": fir_taps_r, "input": fir_in_r, "output": fir_out_r},
+        "biquad": {"input": bq_in_r, "output": bq_out_r},
+        "fft": fft_rand,
+        "scalars": scal_r,
+        "sqrt": [q_sqrt(r, 15) for r in scal_r],
+        "reciprocal": [q_reciprocal(r, 15) for r in scal_r],
+        "convert": conv_r,
+    }
+    v["demo_contract"] = {
+        "frame": dc_frame,
+        "rms": rms_py(dc_bq),
+        "energy": dot(dc_bq, dc_bq, 15),
+        "fft_mag": dc_mag,
+        "fft_peak": dc_peak,
+        "fft_peak_bin": dc_bin,
+    }
+
     with open("tools/vectors.json", "w") as fh:
         json.dump(v, fh, indent=2)
 
@@ -227,7 +912,36 @@ def main():
             fh.write(f"HANN{n} ({len(t)} values):\n")
             fh.write(", ".join(str(x) for x in t) + "\n\n")
 
-    print("vectors.json + hann_tables.txt written")
+    with open("tools/window_tables.txt", "w") as fh:
+        for name, tbl in (("HAMMING", ham), ("BLACKMAN", blk)):
+            for n in (16, 32, 64):
+                t = tbl[n]
+                fh.write(f"{name}{n} ({len(t)} values):\n")
+                fh.write(", ".join(str(x) for x in t) + "\n\n")
+
+    with open("tools/fft_tables.txt", "w") as fh:
+        for n in (16, 32, 64):
+            tw_re, tw_im = fft_tw[n]
+            fh.write(f"TWIDDLE{n}_RE ({len(tw_re)} values):\n")
+            fh.write(", ".join(str(x) for x in tw_re) + "\n\n")
+            fh.write(f"TWIDDLE{n}_IM ({len(tw_im)} values):\n")
+            fh.write(", ".join(str(x) for x in tw_im) + "\n\n")
+            fh.write(f"BITREV{n} ({len(fft_rev[n])} values):\n")
+            fh.write(", ".join(str(x) for x in fft_rev[n]) + "\n\n")
+
+    print("vectors.json + hann_tables.txt + window_tables.txt + fft_tables.txt written")
+    print("demo chain rms:", v["demo_chain"]["rms"],
+          "energy:", v["demo_chain"]["energy"])
+    print("demo chain fft mag:", v["demo_chain"]["fft_mag"])
+    print("differential seed:", v["differential"]["seed"],
+          "fft random errs:",
+          {k: (v["differential"]["fft"][k]["dft_err"],
+               v["differential"]["fft"][k]["roundtrip_err"])
+           for k in v["differential"]["fft"]})
+    print("demo contract frame rms:", v["demo_contract"]["rms"],
+          "energy:", v["demo_contract"]["energy"],
+          "fft peak:", v["demo_contract"]["fft_peak"],
+          "bin:", v["demo_contract"]["fft_peak_bin"])
     print("hann16 sum:", v["hann_props"]["hann16_sum"],
           "peak:", v["hann_props"]["hann16_peak"])
     print("hann32 sum:", v["hann_props"]["hann32_sum"],
@@ -236,6 +950,19 @@ def main():
           "peak:", v["hann_props"]["hann64_peak"])
     print("dot4:", v["dot"]["dot4"], "dot16:", v["dot"]["dot16"])
     print("demo energy:", energy, "windowed sum:", sum(windowed))
+    print("dot_sat max3:", v["dot_sat"]["max3"], "min3:", v["dot_sat"]["min3"],
+          "max_min3:", v["dot_sat"]["max_min3"])
+    print("biquad lp coeffs:", v["biquad"]["lp_coeffs"])
+    print("biquad impulse8:", v["biquad"]["impulse8"])
+    print("biquad step16 last:", v["biquad"]["step16_last"])
+    print("fir taps8:", v["fir"]["taps8"])
+    print("fir taps8 impulse:", v["fir"]["taps8_impulse"])
+    print("hamming16 sum:", v["window_props"]["hamming16_sum"],
+          "peak:", v["window_props"]["hamming16_peak"],
+          "end:", v["window_props"]["hamming16_end"])
+    print("blackman16 sum:", v["window_props"]["blackman16_sum"],
+          "peak:", v["window_props"]["blackman16_peak"],
+          "end:", v["window_props"]["blackman16_end"])
 
 
 if __name__ == "__main__":
