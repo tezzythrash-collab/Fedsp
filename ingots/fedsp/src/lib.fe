@@ -1,0 +1,1539 @@
+//! FeDSP — fixed-point DSP math for Fe.
+//!
+//! Binary Q-format arithmetic on a signed 32-bit raw value: a `Q<FRAC>`
+//! stores the real value `raw / 2^FRAC`. Q15 (audio-rate workhorse) is the
+//! primary format; Q7 and Q31 are provided as aliases, and any `FRAC` in
+//! `0..=31` works.
+//!
+//! Design rules:
+//! - Every operation that can overflow **saturates** instead of wrapping
+//!   or reverting: add, sub, mul, div, conversions, shifts, abs, neg,
+//!   dot products, filter steps, frame statistics, sqrt, reciprocal.
+//! - Multiplication widens to `i64`, rounds to nearest (ties toward +inf),
+//!   then clamps to `i32`. Division truncates toward zero.
+//! - Division by zero never reverts: it saturates to `MAX` / `MIN` by the
+//!   sign of the numerator (or `0` for `0 / 0`).
+//! - The library is pure: no storage, no EVM effects, no contracts. All
+//!   functions run under `fe test` on both the sonatina and native backends.
+//!
+//! Beyond the arithmetic core: `Biquad` (transposed direct form II) and
+//! `Fir` (tap delay line) filters, `convert_q` between Q-formats,
+//! Hann / Hamming / Blackman window tables, `mean` / `rms` / `energy`
+//! frame statistics, `sqrt` / `reciprocal` by Newton iteration, and a
+//! radix-2 FFT / inverse FFT over Q15 complex samples (`Cplx`) at 16,
+//! 32, and 64 points, with a magnitude spectrum helper.
+//!
+//! Relation to the standard library: `core::fixed` provides **decimal**
+//! fixed-point (`Fixed<D>` = `raw / 10^D`, `Wad` / `Ray`) for money and
+//! DeFi. FeDSP provides **binary** Q-format (`raw / 2^FRAC`) for audio and
+//! signal processing, plus the DSP primitives the stdlib does not have:
+//! saturating arithmetic, scaling, shifts, Hann windows, dot products.
+//! The two are complementary, not duplicative.
+
+/// Binary Q-format fixed-point number: value = `raw / 2^FRAC`.
+///
+/// `FRAC` must be in `0..=31`, enforced at compile time by the `where`
+/// clause below: instantiating `Q` outside the range is a compile error.
+/// `Q<0>` is plain `i32` arithmetic;
+/// `Q<31>` spans (-1, 1) and its closest value to `1.0` is `maximum()`.
+pub struct Q<const FRAC: i32> where FRAC >= 0, FRAC <= 31 { raw: i32 }
+
+/// `Q` is a plain 32-bit value: copying it is always safe, and it is what
+/// lets fixed-size arrays of `Q` be built with repetition (`[Q15::zero(); N]`).
+impl<const FRAC: i32> Copy for Q<FRAC> {}
+
+impl<const FRAC: i32> Q<FRAC> {
+    /// Wrap a raw `i32` with no checks. Use for constants and test vectors.
+    pub fn from_raw(raw: i32) -> Self {
+        Self { raw }
+    }
+
+    /// The raw `i32` representation.
+    pub fn raw(self) -> i32 {
+        self.raw
+    }
+
+    /// Zero.
+    pub fn zero() -> Self {
+        Self { raw: 0 }
+    }
+
+    /// The closest representable value to `1.0`. For `FRAC <= 30` this is
+    /// exactly `1.0` (`1 << FRAC`); for `Q<31>`, `1.0` is not representable
+    /// and this saturates to `maximum()` (0.9999999995).
+    pub fn one() -> Self {
+        Self::from_int(x: 1)
+    }
+
+    /// Largest representable value (`raw == i32::MAX`).
+    pub fn maximum() -> Self {
+        Self { raw: 2147483647 }
+    }
+
+    /// Smallest representable value (`raw == i32::MIN`).
+    pub fn minimum() -> Self {
+        Self { raw: -2147483648 }
+    }
+
+    /// Convert an integer, saturating if it does not fit.
+    /// `from_int(x: 70000)` in Q15 saturates to `maximum()`.
+    pub fn from_int(x: i32) -> Self {
+        Self::from_i64(x: x as i64)
+    }
+
+    /// Convert a 64-bit integer, saturating if it does not fit.
+    pub fn from_i64(x: i64) -> Self {
+        let max_int: i64 = (2147483647 as i64) >> (FRAC as i64)
+        let min_int: i64 = -max_int - 1
+        if x > max_int {
+            Self::maximum()
+        } else if x < min_int {
+            Self::minimum()
+        } else {
+            Self { raw: (x << (FRAC as i64)).downcast_truncate() }
+        }
+    }
+
+    /// Integer part: arithmetic shift right (`raw >> FRAC`). Exact for
+    /// non-negative values; for negative values this floors, so the
+    /// integer part of -1.5 is -2, not -1.
+    pub fn to_int(self) -> i32 {
+        self.raw >> FRAC
+    }
+
+    /// Build from a rational `num / den`, rounding to nearest (ties away
+    /// from zero), saturating on overflow. A zero denominator never reverts:
+    /// it yields `maximum()` / `minimum()` by the sign of `num`, or zero
+    /// for `0 / 0`.
+    pub fn from_ratio(num: i32, den: i32) -> Self {
+        if den == 0 {
+            if num > 0 {
+                Self::maximum()
+            } else if num < 0 {
+                Self::minimum()
+            } else {
+                Self::zero()
+            }
+        } else {
+            let v: i64 = (num as i64) << (FRAC as i64)
+            let half: i64 = (den as i64).abs() / 2
+            let den64: i64 = den as i64
+            let rounded: i64 = if (v >= 0) == (den > 0) {
+                (v + half) / den64
+            } else {
+                (v - half) / den64
+            }
+            Self { raw: rounded.downcast_saturate() }
+        }
+    }
+
+    /// True when the value is exactly zero.
+    pub fn is_zero(self) -> bool {
+        self.raw == 0
+    }
+
+    /// True when the value is negative.
+    pub fn is_negative(self) -> bool {
+        self.raw < 0
+    }
+
+    /// Saturating addition: clamps to `maximum()` / `minimum()` on overflow.
+    pub fn sat_add(self, other: Self) -> Self {
+        Self { raw: self.raw.saturating_add(other.raw) }
+    }
+
+    /// Saturating subtraction: clamps to `maximum()` / `minimum()` on overflow.
+    pub fn sat_sub(self, other: Self) -> Self {
+        Self { raw: self.raw.saturating_sub(other.raw) }
+    }
+
+    /// Saturating multiplication, rounding to nearest (ties toward +inf).
+    /// Widens to `i64`, adds half an ulp, shifts, then clamps to `i32`.
+    pub fn sat_mul(self, other: Self) -> Self {
+        let v: i64 = (self.raw as i64) * (other.raw as i64)
+        if FRAC == 0 {
+            Self { raw: v.downcast_saturate() }
+        } else {
+            let half: i64 = 1 << ((FRAC as i64) - 1)
+            let shifted: i64 = (v + half) >> (FRAC as i64)
+            Self { raw: shifted.downcast_saturate() }
+        }
+    }
+
+    /// Saturating division, truncating toward zero. A zero divisor never
+    /// reverts: it yields `maximum()` / `minimum()` by the sign of `self`,
+    /// or zero for `0 / 0`.
+    pub fn sat_div(self, other: Self) -> Self {
+        if other.raw == 0 {
+            if self.raw > 0 {
+                Self::maximum()
+            } else if self.raw < 0 {
+                Self::minimum()
+            } else {
+                Self::zero()
+            }
+        } else {
+            let num: i64 = (self.raw as i64) << (FRAC as i64)
+            let q: i64 = num / (other.raw as i64)
+            Self { raw: q.downcast_saturate() }
+        }
+    }
+
+    /// Saturating negation: `sat_neg(minimum()) == maximum()`.
+    pub fn sat_neg(self) -> Self {
+        if self.raw == -2147483648 {
+            Self::maximum()
+        } else {
+            Self { raw: -self.raw }
+        }
+    }
+
+    /// Saturating absolute value: `abs(minimum()) == maximum()`.
+    pub fn abs(self) -> Self {
+        if self.raw == -2147483648 {
+            Self::maximum()
+        } else {
+            Self { raw: self.raw.abs() }
+        }
+    }
+
+    /// Multiply by a Q-format gain. Alias for `sat_mul`, named for DSP code.
+    pub fn scale(self, gain: Self) -> Self {
+        self.sat_mul(other: gain)
+    }
+
+    /// Multiply the value by a plain integer, saturating.
+    /// `Q15(0.5).scale_int(factor: 3) == Q15(1.5)`.
+    pub fn scale_int(self, factor: i32) -> Self {
+        let v: i64 = (self.raw as i64) * (factor as i64)
+        Self { raw: v.downcast_saturate() }
+    }
+
+    /// Saturating shift left by `n` bits. `n <= 0` returns `self`;
+    /// `n >= 32` saturates by sign (zero stays zero).
+    pub fn shl_sat(self, n: i32) -> Self {
+        if n <= 0 {
+            self
+        } else if n >= 32 {
+            if self.raw > 0 {
+                Self::maximum()
+            } else if self.raw < 0 {
+                Self::minimum()
+            } else {
+                Self::zero()
+            }
+        } else {
+            let v: i64 = (self.raw as i64) << (n as i64)
+            Self { raw: v.downcast_saturate() }
+        }
+    }
+
+    /// Arithmetic shift right by `n` bits (sign-extending). `n <= 0`
+    /// returns `self`; `n >= 31` yields `0` (non-negative) or `-1` (negative).
+    pub fn shr(self, n: i32) -> Self {
+        if n <= 0 {
+            self
+        } else if n >= 31 {
+            if self.raw < 0 {
+                Self { raw: -1 }
+            } else {
+                Self::zero()
+            }
+        } else {
+            Self { raw: self.raw >> n }
+        }
+    }
+
+    /// Clamp to [`lo`, `hi`]. Caller must ensure `lo <= hi`.
+    pub fn clamp(self, lo: Self, hi: Self) -> Self {
+        if self.raw < lo.raw {
+            lo
+        } else if self.raw > hi.raw { hi } else { self }
+    }
+
+    /// Smaller of the two values.
+    pub fn min(self, other: Self) -> Self {
+        if self.raw < other.raw { self } else { other }
+    }
+
+    /// Larger of the two values.
+    pub fn max(self, other: Self) -> Self {
+        if self.raw > other.raw { self } else { other }
+    }
+
+    /// Square root, by Newton iteration on the integer square root
+    /// (`isqrt_round` below). `sqrt(negative) == zero()` — a negative
+    /// has no real root — and the result rounds to nearest (ties toward
+    /// +inf) and saturates to `maximum()`.
+    pub fn sqrt(self) -> Self {
+        if self.raw <= 0 {
+            return Self::zero()
+        }
+        let shifted: i64 = (self.raw as i64) << (FRAC as i64)
+        Self { raw: isqrt_round(x: shifted).downcast_saturate() }
+    }
+
+    /// Reciprocal `1 / self`, by Newton iteration (5 fixed steps).
+    /// Rounds to nearest (ties toward +inf) and saturates on overflow.
+    /// `reciprocal(0) == maximum()` (the div-by-zero rule). The sign of
+    /// a negative input is applied after the iteration, so a saturated
+    /// positive reciprocal negates to `-maximum()`, not `minimum()`.
+    /// For `Q<31>` every reciprocal is unrepresentable (`|1/x| > 1` for
+    /// all `|x| < 1`), so it saturates to `maximum()` / `minimum()` by
+    /// sign. For `Q<0>` the result is the truncated integer reciprocal
+    /// (`-1`, `0`, or `1`). Newton converges to within ~1-2 ulp of the
+    /// true reciprocal; the exact result is pinned by the oracle.
+    pub fn reciprocal(self) -> Self {
+        if self.raw == 0 {
+            return Self::maximum()
+        }
+        if FRAC == 0 {
+            if self.raw == 1 || self.raw == -1 {
+                return Self::from_raw(raw: self.raw)
+            }
+            return Self::zero()
+        }
+        if FRAC >= 31 {
+            if self.raw < 0 {
+                return Self::minimum()
+            }
+            return Self::maximum()
+        }
+        // Normalize |raw| into [2^(FRAC-1), 2^FRAC) by shifting, so the
+        // Newton iteration starts with x' in [0.5, 1).
+        var m: i64 = (self.raw as i64).abs()
+        var k: i32 = 0
+        while m < (1 << ((FRAC as i64) - 1)) {
+            m = m << 1
+            k = k + 1
+        }
+        while m >= (1 << (FRAC as i64)) {
+            m = m >> 1
+            k = k - 1
+        }
+        let x_prime: Self = Self::from_raw(raw: m.downcast_truncate())
+        // y <- y + y * (1 - x' * y), 5 fixed iterations from y0 = 1.5.
+        // The error squares each step (e <- x' * e^2), so 5 steps leave
+        // an error far below 1 ulp; the remaining ~1 ulp is rounding
+        // noise from the saturating multiplies, pinned by the oracle.
+        var y: Self = Self::from_ratio(num: 3, den: 2)
+        var it: i32 = 0
+        while it < 5 {
+            let prod: Self = x_prime.sat_mul(other: y)
+            let one_minus: Self = Self::one().sat_sub(other: prod)
+            y = y.sat_add(other: y.sat_mul(other: one_minus))
+            it += 1
+        }
+        // 1/x = y' * 2^k: shift left (saturating) or right (rounded).
+        let y_raw: i64 = if k >= 0 {
+            (y.raw() as i64) << (k as i64)
+        } else {
+            let d: i64 = (-k) as i64
+            let half: i64 = 1 << (d - 1)
+            ((y.raw() as i64) + half) >> d
+        }
+        let out: Self = Self { raw: y_raw.downcast_saturate() }
+        if self.raw < 0 { out.sat_neg() } else { out }
+    }
+}
+
+/// Q7: 7 fractional bits. Range roughly (-256, 256), step 1/128.
+pub type Q7 = Q<7>
+
+/// Q15: 15 fractional bits. The audio-rate workhorse.
+/// Range (-65536, 65536), step 1/32768; `1.0 == 32768`.
+pub type Q15 = Q<15>
+
+/// Q31: 31 fractional bits. Range (-1, 1), step 1/2^31.
+/// `1.0` is not representable; use `maximum()` for the closest value.
+pub type Q31 = Q<31>
+
+/// Hann window coefficients, Q15 raw values, length 16.
+/// Generated by `tools/gen_vectors.py`:
+/// `round(0.5 * (1 - cos(2*pi*n/(N-1))) * 32767)`. Endpoints are 0,
+/// the table is symmetric, peak is 32409 (0.9891).
+pub const HANN16: [i32; 16] = [
+    0,
+    1416,
+    5421,
+    11321,
+    18096,
+    24575,
+    29638,
+    32409,
+    32409,
+    29638,
+    24575,
+    18096,
+    11321,
+    5421,
+    1416,
+    0,
+]
+
+/// Hann window coefficients, Q15 raw values, length 32. Peak 32683.
+pub const HANN32: [i32; 32] = [
+    0,
+    335,
+    1328,
+    2937,
+    5096,
+    7717,
+    10693,
+    13903,
+    17213,
+    20490,
+    23599,
+    26412,
+    28815,
+    30708,
+    32016,
+    32683,
+    32683,
+    32016,
+    30708,
+    28815,
+    26412,
+    23599,
+    20490,
+    17213,
+    13903,
+    10693,
+    7717,
+    5096,
+    2937,
+    1328,
+    335,
+    0,
+]
+
+/// Hann window coefficients, Q15 raw values, length 64. Peak 32747.
+pub const HANN64: [i32; 64] = [
+    0,
+    81,
+    325,
+    728,
+    1286,
+    1995,
+    2847,
+    3833,
+    4944,
+    6169,
+    7495,
+    8909,
+    10398,
+    11946,
+    13539,
+    15159,
+    16792,
+    18421,
+    20029,
+    21601,
+    23122,
+    24575,
+    25947,
+    27224,
+    28393,
+    29443,
+    30363,
+    31145,
+    31779,
+    32260,
+    32584,
+    32747,
+    32747,
+    32584,
+    32260,
+    31779,
+    31145,
+    30363,
+    29443,
+    28393,
+    27224,
+    25947,
+    24575,
+    23122,
+    21601,
+    20029,
+    18421,
+    16792,
+    15159,
+    13539,
+    11946,
+    10398,
+    8909,
+    7495,
+    6169,
+    4944,
+    3833,
+    2847,
+    1995,
+    1286,
+    728,
+    325,
+    81,
+    0,
+]
+
+/// Dot product of two Q-format vectors: `sum(a[i] * b[i])`.
+/// Accumulates in `i64` with **saturating** addition at every step, so
+/// the accumulator can never overflow and `dot` never reverts — a
+/// saturated accumulator rounds and clamps to `i32` like every other
+/// operation in this library. (v0.2.0 fix: the accumulator used to be a
+/// plain `i64` add, which reverted with arithmetic overflow for 3+
+/// maximum-magnitude elements.)
+pub fn dot<const FRAC: i32, const N: usize>(a: [Q<FRAC>; N], b: [Q<FRAC>; N]) -> Q<FRAC>
+where FRAC >= 0, FRAC <= 31
+{
+    var acc: i64 = 0
+    var i: usize = 0
+    while i < N {
+        acc = acc.saturating_add((a[i].raw() as i64) * (b[i].raw() as i64))
+        i += 1
+    }
+    if FRAC == 0 {
+        Q<FRAC>::from_raw(raw: acc.downcast_saturate())
+    } else {
+        let half: i64 = 1 << ((FRAC as i64) - 1)
+        let shifted: i64 = acc.saturating_add(half) >> (FRAC as i64)
+        Q<FRAC>::from_raw(raw: shifted.downcast_saturate())
+    }
+}
+
+/// Apply a window to Q15 samples: `out[i] = samples[i] * coeffs[i]`
+/// (each coefficient is a Q15 raw value, e.g. from `HANN16`).
+/// Elementwise `sat_mul`, so no element can overflow.
+pub fn window<const N: usize>(samples: [Q15; N], coeffs: [i32; N]) -> [Q15; N] {
+    var out: [Q15; N] = [Q15::zero(); N]
+    var i: usize = 0
+    while i < N {
+        out[i] = samples[i].sat_mul(other: Q15::from_raw(raw: coeffs[i]))
+        i += 1
+    }
+    out
+}
+
+/// Hamming window coefficients, Q15 raw values, length 16.
+/// Generated by `tools/gen_vectors.py`:
+/// `round((0.54 - 0.46 * cos(2*pi*n/(N-1))) * 32767)`. Endpoints are
+/// 2621 (0.08), the table is symmetric, peak is 32438 (0.9900).
+pub const HAMMING16: [i32; 16] = [
+    2621,
+    3924,
+    7608,
+    13036,
+    19270,
+    25231,
+    29888,
+    32438,
+    32438,
+    29888,
+    25231,
+    19270,
+    13036,
+    7608,
+    3924,
+    2621,
+]
+
+/// Hamming window coefficients, Q15 raw values, length 32. Peak 32690.
+pub const HAMMING32: [i32; 32] = [
+    2621,
+    2930,
+    3843,
+    5323,
+    7310,
+    9721,
+    12459,
+    15412,
+    18458,
+    21472,
+    24332,
+    26920,
+    29131,
+    30873,
+    32076,
+    32690,
+    32690,
+    32076,
+    30873,
+    29131,
+    26920,
+    24332,
+    21472,
+    18458,
+    15412,
+    12459,
+    9721,
+    7310,
+    5323,
+    3843,
+    2930,
+    2621,
+]
+
+/// Hamming window coefficients, Q15 raw values, length 64. Peak 32748.
+pub const HAMMING64: [i32; 64] = [
+    2621,
+    2696,
+    2920,
+    3291,
+    3805,
+    4457,
+    5240,
+    6148,
+    7170,
+    8296,
+    9516,
+    10818,
+    12187,
+    13612,
+    15077,
+    16568,
+    18070,
+    19568,
+    21048,
+    22495,
+    23893,
+    25231,
+    26493,
+    27668,
+    28743,
+    29709,
+    30556,
+    31274,
+    31858,
+    32301,
+    32599,
+    32748,
+    32748,
+    32599,
+    32301,
+    31858,
+    31274,
+    30556,
+    29709,
+    28743,
+    27668,
+    26493,
+    25231,
+    23893,
+    22495,
+    21048,
+    19568,
+    18070,
+    16568,
+    15077,
+    13612,
+    12187,
+    10818,
+    9516,
+    8296,
+    7170,
+    6148,
+    5240,
+    4457,
+    3805,
+    3291,
+    2920,
+    2696,
+    2621,
+]
+
+/// Blackman window coefficients, Q15 raw values, length 16.
+/// Generated by `tools/gen_vectors.py`:
+/// `round((0.42 - 0.5 * cos(2*pi*n/(N-1)) + 0.08 * cos(4*pi*n/(N-1)))
+/// * 32767)`. Endpoints are 0, the table is symmetric, peak is 32182
+/// (0.9820).
+pub const BLACKMAN16: [i32; 16] = [
+    0,
+    549,
+    2525,
+    6579,
+    12911,
+    20643,
+    27827,
+    32182,
+    32182,
+    27827,
+    20643,
+    12911,
+    6579,
+    2525,
+    549,
+    0,
+]
+
+/// Blackman window coefficients, Q15 raw values, length 32. Peak 32629.
+pub const BLACKMAN32: [i32; 32] = [
+    0,
+    123,
+    512,
+    1226,
+    2342,
+    3941,
+    6083,
+    8780,
+    11984,
+    15577,
+    19373,
+    23134,
+    26590,
+    29474,
+    31546,
+    32629,
+    32629,
+    31546,
+    29474,
+    26590,
+    23134,
+    19373,
+    15577,
+    11984,
+    8780,
+    6083,
+    3941,
+    2342,
+    1226,
+    512,
+    123,
+    0,
+]
+
+/// Blackman window coefficients, Q15 raw values, length 64. Peak 32734.
+pub const BLACKMAN64: [i32; 64] = [
+    0,
+    29,
+    119,
+    272,
+    495,
+    796,
+    1183,
+    1667,
+    2257,
+    2964,
+    3795,
+    4758,
+    5855,
+    7088,
+    8454,
+    9946,
+    11552,
+    13259,
+    15046,
+    16890,
+    18766,
+    20643,
+    22491,
+    24277,
+    25968,
+    27532,
+    28938,
+    30158,
+    31166,
+    31941,
+    32468,
+    32734,
+    32734,
+    32468,
+    31941,
+    31166,
+    30158,
+    28938,
+    27532,
+    25968,
+    24277,
+    22491,
+    20643,
+    18766,
+    16890,
+    15046,
+    13259,
+    11552,
+    9946,
+    8454,
+    7088,
+    5855,
+    4758,
+    3795,
+    2964,
+    2257,
+    1667,
+    1183,
+    796,
+    495,
+    272,
+    119,
+    29,
+    0,
+]
+
+/// Convert a Q-format value to another Q-format, rounding to nearest
+/// (ties toward +inf, the same convention as `sat_mul`) and saturating
+/// on overflow. Shifting left widens the value; shifting right drops
+/// low bits with rounding. `convert_q` between equal formats is the
+/// identity.
+pub fn convert_q<const FROM: i32, const TO: i32>(x: Q<FROM>) -> Q<TO>
+where FROM >= 0, FROM <= 31, TO >= 0, TO <= 31
+{
+    if FROM == TO {
+        Q::from_raw(raw: x.raw())
+    } else if FROM > TO {
+        let d: i64 = (FROM - TO) as i64
+        let half: i64 = 1 << (d - 1)
+        let shifted: i64 = ((x.raw() as i64) + half) >> d
+        Q::from_raw(raw: shifted.downcast_saturate())
+    } else {
+        let d: i64 = (TO - FROM) as i64
+        let shifted: i64 = (x.raw() as i64) << d
+        Q::from_raw(raw: shifted.downcast_saturate())
+    }
+}
+
+/// Integer square root of a non-negative `i64`, rounded to nearest
+/// (ties toward +inf), by Newton iteration. `x <= 0` returns `0`.
+/// Used by `Q::sqrt` and `rms`. The iteration is monotone decreasing
+/// from `x / 2 + 1`, so it always terminates; the rounding step compares
+/// the remainder against the root (`r > s` rounds up), which never
+/// overflows because `s <= sqrt(x)`.
+pub fn isqrt_round(x: i64) -> i64 {
+    if x <= 0 { return 0 }
+    var y: i64 = x / 2 + 1
+    var y_next: i64 = (y + x / y) / 2
+    while y_next < y {
+        y = y_next
+        y_next = (y + x / y) / 2
+    }
+    let r: i64 = x - y * y
+    if r > y { y + 1 } else { y }
+}
+
+/// Mean of a Q15 frame, rounding to nearest (ties toward +inf) and
+/// saturating on overflow. The sum accumulates in `i64` with saturation.
+pub fn mean<const N: usize>(x: [Q15; N]) -> Q15 {
+    var acc: i64 = 0
+    var i: usize = 0
+    while i < N {
+        acc = acc.saturating_add(x[i].raw() as i64)
+        i += 1
+    }
+    let n: i64 = N.downcast_truncate()
+    let q: i64 = acc / n
+    let rem: i64 = acc % n
+    // Round to nearest, ties toward +inf (same convention as sat_mul).
+    // Positive: round up iff 2*rem >= n. Negative: round down iff
+    // 2*(-rem) > n — a tie at exactly -0.5 stays at q (toward +inf).
+    let rounded: i64 = if acc >= 0 {
+        if rem >= (n + 1) / 2 { q + 1 } else { q }
+    } else {
+        if rem <= -((n / 2) + 1) { q - 1 } else { q }
+    }
+    Q15::from_raw(raw: rounded.downcast_saturate())
+}
+
+/// Energy of a Q15 frame: `dot(x, x)`, saturating like `dot`.
+pub fn energy<const N: usize>(x: [Q15; N]) -> Q15 {
+    dot(a: x, b: x)
+}
+
+/// Root-mean-square of a Q15 frame: the square root of the mean of the
+/// squares, rounding to nearest. The sum of squares accumulates in `i64`
+/// with saturation, so `rms` never reverts.
+pub fn rms<const N: usize>(x: [Q15; N]) -> Q15 {
+    var acc: i64 = 0
+    var i: usize = 0
+    while i < N {
+        let r: i64 = x[i].raw() as i64
+        acc = acc.saturating_add(r * r)
+        i += 1
+    }
+    let n: i64 = N.downcast_truncate()
+    let m: i64 = acc / n
+    Q15::from_raw(raw: isqrt_round(x: m).downcast_saturate())
+}
+
+/// Second-order IIR (biquad) filter, transposed direct form II.
+///
+/// Coefficients and state are Q15; every multiply and add saturates, so
+/// a filter can never revert, whatever the input. `step` updates the
+/// state in place through a mutable borrow (`step(self: mut Self, ...)`),
+/// the idiomatic Fe 26.5 pattern for stateful filters; the caller keeps
+/// the filter in a `var` binding and calls `step` once per sample.
+///
+/// Transfer function: `H(z) = (b0 + b1 z^-1 + b2 z^-2) /
+/// (1 + a1 z^-1 + a2 z^-2)`, with the recurrence
+/// `y = b0*x + z1`, `z1 = b1*x - a1*y + z2`, `z2 = b2*x - a2*y`.
+pub struct Biquad { b0: Q15, b1: Q15, b2: Q15, a1: Q15, a2: Q15, z1: Q15, z2: Q15 }
+
+impl Biquad {
+    /// Build a biquad from Q15 coefficients, state starting at zero.
+    pub fn new(b0: Q15, b1: Q15, b2: Q15, a1: Q15, a2: Q15) -> Self {
+        Self { b0, b1, b2, a1, a2, z1: Q15::zero(), z2: Q15::zero() }
+    }
+
+    /// Documented example: 2nd-order Butterworth lowpass, fc = 0.1 * fs.
+    /// Coefficients (Q15 raw): b0 = 2210, b1 = 4421, b2 = 2210,
+    /// a1 = -37453, a2 = 13527. DC gain is 1.0 (within rounding).
+    pub fn lowpass_01() -> Self {
+        Self::new(
+            b0: Q15::from_raw(raw: 2210),
+            b1: Q15::from_raw(raw: 4421),
+            b2: Q15::from_raw(raw: 2210),
+            a1: Q15::from_raw(raw: -37453),
+            a2: Q15::from_raw(raw: 13527),
+        )
+    }
+
+    /// One sample step: update the state in place and return the output.
+    pub fn step(self: mut Self, x: Q15) -> Q15 {
+        let y: Q15 = self.b0.sat_mul(other: x).sat_add(other: self.z1)
+        let z1: Q15 = self
+            .b1
+            .sat_mul(other: x)
+            .sat_sub(other: self.a1.sat_mul(other: y))
+            .sat_add(other: self.z2)
+        let z2: Q15 = self.b2.sat_mul(other: x).sat_sub(other: self.a2.sat_mul(other: y))
+        self.z1 = z1
+        self.z2 = z2
+        y
+    }
+
+    /// Reset the state to zero, keeping the coefficients.
+    pub fn reset(self: mut Self) {
+        self.z1 = Q15::zero()
+        self.z2 = Q15::zero()
+    }
+}
+
+/// Finite-impulse-response filter: a tap delay line over the saturating
+/// `dot` product. `step` updates the delay line in place through a
+/// mutable borrow, the same pattern as `Biquad::step`.
+pub struct Fir<const N: usize> { taps: [Q15; N], delay: [Q15; N] }
+
+impl<const N: usize> Fir<N> {
+    /// Build an FIR filter from Q15 taps, delay line starting at zero.
+    pub fn new(taps: [Q15; N]) -> Self {
+        Self { taps, delay: [Q15::zero(); N] }
+    }
+
+    /// One sample step: shift the delay line, then `dot(taps, delay)`.
+    /// Returns the output sample.
+    pub fn step(self: mut Self, x: Q15) -> Q15 {
+        var d: [Q15; N] = [Q15::zero(); N]
+        d[0] = x
+        var i: usize = 1
+        while i < N {
+            d[i] = self.delay[i - 1]
+            i += 1
+        }
+        self.delay = d
+        dot(a: self.taps, b: d)
+    }
+
+    /// Reset the delay line to zero, keeping the taps.
+    pub fn reset(self: mut Self) {
+        self.delay = [Q15::zero(); N]
+    }
+}
+/// FFT twiddle factors W_16^k = exp(-2*pi*i*k/16), real part, Q15 raw. Generated by `tools/gen_vectors.py`.
+pub const TWIDDLE16_RE: [i32; 16] = [
+    32768,
+    30274,
+    23170,
+    12540,
+    0,
+    -12540,
+    -23170,
+    -30274,
+    -32768,
+    -30274,
+    -23170,
+    -12540,
+    0,
+    12540,
+    23170,
+    30274,
+]
+
+/// FFT twiddle factors W_16^k = exp(-2*pi*i*k/16), imaginary part, Q15 raw. Generated by `tools/gen_vectors.py`.
+pub const TWIDDLE16_IM: [i32; 16] = [
+    0,
+    -12540,
+    -23170,
+    -30274,
+    -32768,
+    -30274,
+    -23170,
+    -12540,
+    0,
+    12540,
+    23170,
+    30274,
+    32768,
+    30274,
+    23170,
+    12540,
+]
+
+/// Bit-reversal permutation for a 16-point radix-2 FFT. Generated by `tools/gen_vectors.py`.
+pub const BITREV16: [usize; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15]
+
+/// FFT twiddle factors W_32^k, real part, Q15 raw. Generated by `tools/gen_vectors.py`.
+pub const TWIDDLE32_RE: [i32; 32] = [
+    32768,
+    32138,
+    30274,
+    27246,
+    23170,
+    18205,
+    12540,
+    6393,
+    0,
+    -6393,
+    -12540,
+    -18205,
+    -23170,
+    -27246,
+    -30274,
+    -32138,
+    -32768,
+    -32138,
+    -30274,
+    -27246,
+    -23170,
+    -18205,
+    -12540,
+    -6393,
+    0,
+    6393,
+    12540,
+    18205,
+    23170,
+    27246,
+    30274,
+    32138,
+]
+
+/// FFT twiddle factors W_32^k, imaginary part, Q15 raw. Generated by `tools/gen_vectors.py`.
+pub const TWIDDLE32_IM: [i32; 32] = [
+    0,
+    -6393,
+    -12540,
+    -18205,
+    -23170,
+    -27246,
+    -30274,
+    -32138,
+    -32768,
+    -32138,
+    -30274,
+    -27246,
+    -23170,
+    -18205,
+    -12540,
+    -6393,
+    0,
+    6393,
+    12540,
+    18205,
+    23170,
+    27246,
+    30274,
+    32138,
+    32768,
+    32138,
+    30274,
+    27246,
+    23170,
+    18205,
+    12540,
+    6393,
+]
+
+/// Bit-reversal permutation for a 32-point radix-2 FFT. Generated by `tools/gen_vectors.py`.
+pub const BITREV32: [usize; 32] = [
+    0,
+    16,
+    8,
+    24,
+    4,
+    20,
+    12,
+    28,
+    2,
+    18,
+    10,
+    26,
+    6,
+    22,
+    14,
+    30,
+    1,
+    17,
+    9,
+    25,
+    5,
+    21,
+    13,
+    29,
+    3,
+    19,
+    11,
+    27,
+    7,
+    23,
+    15,
+    31,
+]
+
+/// FFT twiddle factors W_64^k, real part, Q15 raw. Generated by `tools/gen_vectors.py`.
+pub const TWIDDLE64_RE: [i32; 64] = [
+    32768,
+    32610,
+    32138,
+    31357,
+    30274,
+    28899,
+    27246,
+    25330,
+    23170,
+    20788,
+    18205,
+    15447,
+    12540,
+    9512,
+    6393,
+    3212,
+    0,
+    -3212,
+    -6393,
+    -9512,
+    -12540,
+    -15447,
+    -18205,
+    -20788,
+    -23170,
+    -25330,
+    -27246,
+    -28899,
+    -30274,
+    -31357,
+    -32138,
+    -32610,
+    -32768,
+    -32610,
+    -32138,
+    -31357,
+    -30274,
+    -28899,
+    -27246,
+    -25330,
+    -23170,
+    -20788,
+    -18205,
+    -15447,
+    -12540,
+    -9512,
+    -6393,
+    -3212,
+    0,
+    3212,
+    6393,
+    9512,
+    12540,
+    15447,
+    18205,
+    20788,
+    23170,
+    25330,
+    27246,
+    28899,
+    30274,
+    31357,
+    32138,
+    32610,
+]
+
+/// FFT twiddle factors W_64^k, imaginary part, Q15 raw. Generated by `tools/gen_vectors.py`.
+pub const TWIDDLE64_IM: [i32; 64] = [
+    0,
+    -3212,
+    -6393,
+    -9512,
+    -12540,
+    -15447,
+    -18205,
+    -20788,
+    -23170,
+    -25330,
+    -27246,
+    -28899,
+    -30274,
+    -31357,
+    -32138,
+    -32610,
+    -32768,
+    -32610,
+    -32138,
+    -31357,
+    -30274,
+    -28899,
+    -27246,
+    -25330,
+    -23170,
+    -20788,
+    -18205,
+    -15447,
+    -12540,
+    -9512,
+    -6393,
+    -3212,
+    0,
+    3212,
+    6393,
+    9512,
+    12540,
+    15447,
+    18205,
+    20788,
+    23170,
+    25330,
+    27246,
+    28899,
+    30274,
+    31357,
+    32138,
+    32610,
+    32768,
+    32610,
+    32138,
+    31357,
+    30274,
+    28899,
+    27246,
+    25330,
+    23170,
+    20788,
+    18205,
+    15447,
+    12540,
+    9512,
+    6393,
+    3212,
+]
+
+/// Bit-reversal permutation for a 64-point radix-2 FFT. Generated by `tools/gen_vectors.py`.
+pub const BITREV64: [usize; 64] = [
+    0,
+    32,
+    16,
+    48,
+    8,
+    40,
+    24,
+    56,
+    4,
+    36,
+    20,
+    52,
+    12,
+    44,
+    28,
+    60,
+    2,
+    34,
+    18,
+    50,
+    10,
+    42,
+    26,
+    58,
+    6,
+    38,
+    22,
+    54,
+    14,
+    46,
+    30,
+    62,
+    1,
+    33,
+    17,
+    49,
+    9,
+    41,
+    25,
+    57,
+    5,
+    37,
+    21,
+    53,
+    13,
+    45,
+    29,
+    61,
+    3,
+    35,
+    19,
+    51,
+    11,
+    43,
+    27,
+    59,
+    7,
+    39,
+    23,
+    55,
+    15,
+    47,
+    31,
+    63,
+]
+
+/// Complex Q15 number: value = `(re + i * im) / 2^15`. The FFT works
+/// on arrays of `Cplx`; every operation saturates componentwise, so a
+/// complex multiply or add can never revert.
+pub struct Cplx { re: Q15, im: Q15 }
+
+/// `Cplx` is two plain 32-bit values: copying it is always safe, and
+/// it is what lets fixed-size arrays of `Cplx` be built with repetition.
+impl Copy for Cplx {}
+
+impl Cplx {
+    /// Build from real and imaginary Q15 parts.
+    pub fn new(re: Q15, im: Q15) -> Self {
+        Self { re, im }
+    }
+
+    /// Zero (0 + 0i).
+    pub fn zero() -> Self {
+        Self { re: Q15::zero(), im: Q15::zero() }
+    }
+
+    /// Real part as a Q15 value.
+    pub fn re(self) -> Q15 {
+        self.re
+    }
+
+    /// Imaginary part as a Q15 value.
+    pub fn im(self) -> Q15 {
+        self.im
+    }
+
+    /// A real-valued complex number (`im == 0`).
+    pub fn from_re(re: Q15) -> Self {
+        Self { re, im: Q15::zero() }
+    }
+
+    /// Saturating complex addition, componentwise.
+    pub fn add(self, other: Self) -> Self {
+        Self { re: self.re.sat_add(other: other.re), im: self.im.sat_add(other: other.im) }
+    }
+
+    /// Saturating complex subtraction, componentwise.
+    pub fn sub(self, other: Self) -> Self {
+        Self { re: self.re.sat_sub(other: other.re), im: self.im.sat_sub(other: other.im) }
+    }
+
+    /// Complex multiplication: `(a + bi)(c + di) = (ac - bd) +
+    /// (ad + bc)i`, each product a `sat_mul`, each sum/difference
+    /// saturating. Never reverts.
+    pub fn mul(self, other: Self) -> Self {
+        Self {
+            re: self.re.sat_mul(other: other.re).sat_sub(other: self.im.sat_mul(other: other.im)),
+            im: self.re.sat_mul(other: other.im).sat_add(other: self.im.sat_mul(other: other.re)),
+        }
+    }
+
+    /// Complex conjugate: negate the imaginary part (saturating, so
+    /// `conj` of an `i32::MIN` imaginary part gives `maximum()`).
+    pub fn conj(self) -> Self {
+        Self { re: self.re, im: self.im.sat_neg() }
+    }
+
+    /// `|self|^2` as a Q15 value: `re * re + im * im`, each product a
+    /// `sat_mul`, the sum saturating. Exact while `|self| <= 256`
+    /// (Q15 value); above that it saturates to `maximum()`.
+    pub fn magnitude_squared(self) -> Q15 {
+        self.re.sat_mul(other: self.re).sat_add(other: self.im.sat_mul(other: self.im))
+    }
+
+    /// `|self|` as a Q15 value: the square root of
+    /// `magnitude_squared`, rounding to nearest. Exact while
+    /// `|self| <= 256` (Q15 value); above that it saturates.
+    pub fn magnitude(self) -> Q15 {
+        self.magnitude_squared().sqrt()
+    }
+}
+
+/// Divide an `i32` raw by `2^s`, rounding to nearest (ties toward
+/// +inf, the same convention as `sat_mul`), saturating. `s <= 0`
+/// returns the input unchanged. Used by the inverse FFT to scale by
+/// `1 / N`.
+fn div_pow2_round(x: i32, s: i32) -> i32 {
+    if s <= 0 {
+        x
+    } else {
+        let half: i64 = 1 << ((s as i64) - 1)
+        let v: i64 = ((x as i64) + half) >> (s as i64)
+        v.downcast_saturate()
+    }
+}
+
+/// Iterative radix-2 decimation-in-time FFT core (unscaled) over Q15
+/// complex samples. `tw_re` / `tw_im` are the full-length twiddle
+/// tables (`W_N^k = exp(-2 * pi * i * k / N)`, Q15 raw); `rev` is the
+/// bit-reversal permutation for size `N`.
+///
+/// Scaling: the forward FFT is **unscaled** — `X[k] = sum_n x[n] *
+/// W_N^(k*n)`, so a bin magnitude can grow by up to `N` over the input
+/// magnitude. For real audio inputs (`|x| <= 1.0` in Q15) the largest
+/// bin is `N * 32768` raw, far inside `i32`; saturation only bites for
+/// near-full-range `i32` raws (e.g. a DC frame of `maximum()`), and
+/// then the butterfly's saturating adds clamp instead of reverting.
+/// The inverse FFT scales by exactly `1 / N` (rounding divide), so
+/// `ifft(fft(x)) == x` within 1 ulp.
+fn fft_core<const N: usize>(
+    x: [Cplx; N],
+    tw_re: [i32; N],
+    tw_im: [i32; N],
+    rev: [usize; N],
+) -> [Cplx; N] {
+    var a: [Cplx; N] = [Cplx::zero(); N]
+    var i: usize = 0
+    while i < N {
+        a[i] = x[rev[i]]
+        i += 1
+    }
+    var len: usize = 2
+    while len <= N {
+        let half: usize = len / 2
+        let step: usize = N / len
+        var base: usize = 0
+        while base < N {
+            var j: usize = 0
+            while j < half {
+                let w = Cplx::new(
+                    re: Q15::from_raw(raw: tw_re[j * step]),
+                    im: Q15::from_raw(raw: tw_im[j * step]),
+                )
+                let t = w.mul(other: a[base + j + half])
+                let u = a[base + j]
+                a[base + j] = u.add(other: t)
+                a[base + j + half] = u.sub(other: t)
+                j += 1
+            }
+            base += len
+        }
+        len = len * 2
+    }
+    a
+}
+
+/// Inverse FFT core by the conjugate trick: `conj(fft(conj(x))) / N`.
+/// `log_n` is `log2(N)`; the final scale divides each component by
+/// `2^log_n` with rounding to nearest. See `fft_core` for the scaling
+/// and saturation behavior.
+fn ifft_core<const N: usize>(
+    x: [Cplx; N],
+    tw_re: [i32; N],
+    tw_im: [i32; N],
+    rev: [usize; N],
+    log_n: i32,
+) -> [Cplx; N] {
+    var conj_in: [Cplx; N] = [Cplx::zero(); N]
+    var i: usize = 0
+    while i < N {
+        conj_in[i] = x[i].conj()
+        i += 1
+    }
+    let f = fft_core(x: conj_in, tw_re: tw_re, tw_im: tw_im, rev: rev)
+    var out: [Cplx; N] = [Cplx::zero(); N]
+    i = 0
+    while i < N {
+        let c = f[i].conj()
+        out[i] = Cplx::new(
+            re: Q15::from_raw(raw: div_pow2_round(x: c.re().raw(), s: log_n)),
+            im: Q15::from_raw(raw: div_pow2_round(x: c.im().raw(), s: log_n)),
+        )
+        i += 1
+    }
+    out
+}
+
+/// 16-point FFT (unscaled forward transform). See `fft_core`.
+pub fn fft16(x: [Cplx; 16]) -> [Cplx; 16] {
+    fft_core(
+        x: x,
+        tw_re: TWIDDLE16_RE,
+        tw_im: TWIDDLE16_IM,
+        rev: BITREV16,
+    )
+}
+
+/// 16-point inverse FFT. `ifft16(fft16(x)) == x` within 1 ulp.
+pub fn ifft16(x: [Cplx; 16]) -> [Cplx; 16] {
+    ifft_core(
+        x: x,
+        tw_re: TWIDDLE16_RE,
+        tw_im: TWIDDLE16_IM,
+        rev: BITREV16,
+        log_n: 4,
+    )
+}
+
+/// 32-point FFT (unscaled forward transform). See `fft_core`.
+pub fn fft32(x: [Cplx; 32]) -> [Cplx; 32] {
+    fft_core(
+        x: x,
+        tw_re: TWIDDLE32_RE,
+        tw_im: TWIDDLE32_IM,
+        rev: BITREV32,
+    )
+}
+
+/// 32-point inverse FFT. `ifft32(fft32(x)) == x` within 1 ulp.
+pub fn ifft32(x: [Cplx; 32]) -> [Cplx; 32] {
+    ifft_core(
+        x: x,
+        tw_re: TWIDDLE32_RE,
+        tw_im: TWIDDLE32_IM,
+        rev: BITREV32,
+        log_n: 5,
+    )
+}
+
+/// 64-point FFT (unscaled forward transform). See `fft_core`.
+pub fn fft64(x: [Cplx; 64]) -> [Cplx; 64] {
+    fft_core(
+        x: x,
+        tw_re: TWIDDLE64_RE,
+        tw_im: TWIDDLE64_IM,
+        rev: BITREV64,
+    )
+}
+
+/// 64-point inverse FFT. `ifft64(fft64(x)) == x` within 1 ulp.
+pub fn ifft64(x: [Cplx; 64]) -> [Cplx; 64] {
+    ifft_core(
+        x: x,
+        tw_re: TWIDDLE64_RE,
+        tw_im: TWIDDLE64_IM,
+        rev: BITREV64,
+        log_n: 6,
+    )
+}
+
+/// Magnitude spectrum: `|X[k]|` per bin, Q15. Exact while every bin
+/// magnitude is `<= 256` (Q15 value); above that it saturates — for
+/// real audio inputs (`|x| <= 1.0`) the largest bin is `N`, so this
+/// never saturates at 16/32/64 points.
+pub fn fft_magnitude<const N: usize>(x: [Cplx; N]) -> [Q15; N] {
+    var out: [Q15; N] = [Q15::zero(); N]
+    var i: usize = 0
+    while i < N {
+        out[i] = x[i].magnitude()
+        i += 1
+    }
+    out
+}

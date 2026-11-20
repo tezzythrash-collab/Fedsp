@@ -1,0 +1,3363 @@
+// FeDSP test suite.
+//
+// Every expected value below was computed by an independent Python oracle
+// (`tools/gen_vectors.py`, exact arbitrary-precision integer arithmetic),
+// not by copying Fe output. If a value here disagrees with Fe, the Fe
+// implementation or its documented semantics are wrong — not the vector.
+
+use ingot::{
+    Q,
+    Q7,
+    Q15,
+    Q31,
+    HANN16,
+    HANN32,
+    HANN64,
+    HAMMING16,
+    HAMMING32,
+    HAMMING64,
+    BLACKMAN16,
+    BLACKMAN32,
+    BLACKMAN64,
+    Biquad,
+    Cplx,
+    Fir,
+    convert_q,
+    dot,
+    energy,
+    fft16,
+    fft32,
+    fft64,
+    fft_magnitude,
+    ifft16,
+    ifft32,
+    ifft64,
+    mean,
+    rms,
+    window,
+}
+
+fn sum_i32<const N: usize>(a: [i32; N]) -> i32 {
+    var s = 0
+    var i: usize = 0
+    while i < N {
+        s += a[i]
+        i += 1
+    }
+    s
+}
+
+/// Compare a Q15 frame against oracle raw values, element by element.
+fn assert_q15_frame<const N: usize>(got: [Q15; N], want: [i32; N]) {
+    var i: usize = 0
+    while i < N {
+        assert!(got[i].raw() == want[i])
+        i += 1
+    }
+}
+
+/// Run a biquad over a frame, threading the state through each sample.
+fn run_biquad<const N: usize>(bq: mut Biquad, xs: [Q15; N]) -> [Q15; N] {
+    var out: [Q15; N] = [Q15::zero(); N]
+    var i: usize = 0
+    while i < N {
+        out[i] = bq.step(x: xs[i])
+        i += 1
+    }
+    out
+}
+
+/// Run an FIR filter over a frame, threading the delay line through.
+fn run_fir<const N: usize, const M: usize>(fir: mut Fir<N>, xs: [Q15; M]) -> [Q15; M] {
+    var out: [Q15; M] = [Q15::zero(); M]
+    var i: usize = 0
+    while i < M {
+        out[i] = fir.step(x: xs[i])
+        i += 1
+    }
+    out
+}
+
+/// Build a complex frame from a real Q15 frame (`im == 0`).
+fn to_cplx<const N: usize>(xs: [Q15; N]) -> [Cplx; N] {
+    var out: [Cplx; N] = [Cplx::zero(); N]
+    var i: usize = 0
+    while i < N {
+        out[i] = Cplx::from_re(re: xs[i])
+        i += 1
+    }
+    out
+}
+
+/// Build a complex frame from separate real/imaginary Q15 frames.
+fn to_cplx2<const N: usize>(re: [Q15; N], im: [Q15; N]) -> [Cplx; N] {
+    var out: [Cplx; N] = [Cplx::zero(); N]
+    var i: usize = 0
+    while i < N {
+        out[i] = Cplx::new(re: re[i], im: im[i])
+        i += 1
+    }
+    out
+}
+
+/// A unit impulse as a complex frame: 1.0 at index 0, zero elsewhere.
+fn impulse_cplx<const N: usize>() -> [Cplx; N] {
+    var out: [Cplx; N] = [Cplx::zero(); N]
+    out[0] = Cplx::from_re(re: Q15::one())
+    out
+}
+
+/// A DC frame: every sample is 1.0 + 0i.
+fn dc_cplx<const N: usize>() -> [Cplx; N] {
+    [Cplx::from_re(re: Q15::one()); N]
+}
+
+/// Compare a complex frame against oracle raw values, element by
+/// element (real and imaginary parts).
+fn assert_cplx_frame<const N: usize>(got: [Cplx; N], want_re: [i32; N], want_im: [i32; N]) {
+    var i: usize = 0
+    while i < N {
+        assert!(got[i].re().raw() == want_re[i])
+        assert!(got[i].im().raw() == want_im[i])
+        i += 1
+    }
+}
+
+/// Sum of |x|^2 over a real Q15 frame, in i64 (test-only helper; the
+/// test inputs are bounded, so the sum cannot overflow i64).
+fn sum_sq_q15<const N: usize>(x: [Q15; N]) -> i64 {
+    var s: i64 = 0
+    var i: usize = 0
+    while i < N {
+        let r: i64 = x[i].raw() as i64
+        s += r * r
+        i += 1
+    }
+    s
+}
+
+/// Sum of |x|^2 over a complex frame, in i64 (test-only helper).
+fn sum_sq_cplx<const N: usize>(x: [Cplx; N]) -> i64 {
+    var s: i64 = 0
+    var i: usize = 0
+    while i < N {
+        let r: i64 = x[i].re().raw() as i64
+        let m: i64 = x[i].im().raw() as i64
+        s += r * r + m * m
+        i += 1
+    }
+    s
+}
+
+/// Parseval check for a real input: sum |X|^2 == N * sum |x|^2 within
+/// rounding. The oracle measures the relative error at ~2e-5; the
+/// bound here is 1e-3 of the frequency-domain sum, with wide headroom.
+/// A transform that is not (close to) the DFT would fail this by far
+/// more than the bound.
+fn assert_parseval<const N: usize>(x: [Q15; N], spec: [Cplx; N]) {
+    let tsum: i64 = sum_sq_q15(x: x)
+    let fsum: i64 = sum_sq_cplx(x: spec)
+    let n: i64 = N.downcast_truncate()
+    let expect: i64 = n * tsum
+    let diff: i64 = if fsum >= expect {
+        fsum - expect
+    } else {
+        expect - fsum
+    }
+    assert!(diff <= fsum / 1000)
+}
+
+/// Parseval check for a complex input (same bound as `assert_parseval`).
+fn assert_parseval_cplx<const N: usize>(x: [Cplx; N], spec: [Cplx; N]) {
+    let tsum: i64 = sum_sq_cplx(x: x)
+    let fsum: i64 = sum_sq_cplx(x: spec)
+    let n: i64 = N.downcast_truncate()
+    let expect: i64 = n * tsum
+    let diff: i64 = if fsum >= expect {
+        fsum - expect
+    } else {
+        expect - fsum
+    }
+    assert!(diff <= fsum / 1000)
+}
+
+#[test]
+fn conversions_from_int() {
+    assert!(Q15::from_int(x: 2).raw() == 65536)
+    assert!(Q15::from_int(x: -3).raw() == -98304)
+    assert!(Q15::from_int(x: 70000).raw() == 2147483647)
+    assert!(Q15::from_int(x: -70000).raw() == -2147483648)
+    assert!(Q31::from_int(x: 1).raw() == 2147483647)
+    assert!(Q31::from_int(x: -2).raw() == -2147483648)
+    assert!(Q7::from_int(x: 100).raw() == 12800)
+    assert!(Q15::from_int(x: 2).to_int() == 2)
+    assert!(Q15::from_int(x: -3).to_int() == -3)
+    // to_int floors for negatives: -1.5 -> -2
+    assert!(Q15::from_raw(raw: -49152).to_int() == -2)
+    assert!(Q15::from_raw(raw: 49152).to_int() == 1)
+}
+
+#[test]
+fn conversions_from_i64() {
+    assert!(Q15::from_i64(x: 70000).raw() == 2147483647)
+    assert!(Q15::from_i64(x: -70000).raw() == -2147483648)
+    assert!(Q15::from_i64(x: 42).raw() == 1376256)
+}
+
+#[test]
+fn conversions_from_ratio() {
+    assert!(Q15::from_ratio(num: 3, den: 4).raw() == 24576)
+    assert!(Q15::from_ratio(num: -1, den: 2).raw() == -16384)
+    assert!(Q15::from_ratio(num: 1, den: 3).raw() == 10923)
+    assert!(Q15::from_ratio(num: 2, den: 3).raw() == 21845)
+    assert!(Q15::from_ratio(num: 1, den: 0).raw() == 2147483647)
+    assert!(Q15::from_ratio(num: -1, den: 0).raw() == -2147483648)
+    assert!(Q15::from_ratio(num: 0, den: 0).raw() == 0)
+}
+
+#[test]
+fn constants() {
+    assert!(Q15::zero().raw() == 0)
+    assert!(Q15::one().raw() == 32768)
+    assert!(Q7::one().raw() == 128)
+    // Q31 cannot represent 1.0: one() saturates to maximum()
+    assert!(Q31::one().raw() == 2147483647)
+    assert!(Q15::maximum().raw() == 2147483647)
+    assert!(Q15::minimum().raw() == -2147483648)
+    assert!(Q15::zero().is_zero())
+    assert!(!Q15::one().is_zero())
+    assert!(Q15::from_raw(raw: -5).is_negative())
+    assert!(!Q15::from_raw(raw: 5).is_negative())
+}
+
+#[test]
+fn sat_add_sub() {
+    let max = Q15::maximum()
+    let min = Q15::minimum()
+    assert!(
+        max.sat_add(other: Q15::from_raw(raw: 1)).raw() == 2147483647,
+    )
+    assert!(
+        min.sat_add(other: Q15::from_raw(raw: -1)).raw() == -2147483648,
+    )
+    assert!(
+        Q15::from_raw(raw: -100).sat_add(other: Q15::from_raw(raw: 250)).raw() == 150,
+    )
+    assert!(
+        min.sat_sub(other: Q15::from_raw(raw: 1)).raw() == -2147483648,
+    )
+    assert!(
+        max.sat_sub(other: Q15::from_raw(raw: -1)).raw() == 2147483647,
+    )
+    assert!(
+        Q15::from_raw(raw: 100).sat_sub(other: Q15::from_raw(raw: 250)).raw() == -150,
+    )
+}
+
+#[test]
+fn sat_mul() {
+    let half = Q15::from_raw(raw: 16384)
+    let one = Q15::one()
+    assert!(half.sat_mul(other: half).raw() == 8192)
+    assert!(half.sat_neg().sat_mul(other: half).raw() == -8192)
+    assert!(one.sat_mul(other: one).raw() == 32768)
+    assert!(
+        Q15::maximum().sat_mul(other: Q15::maximum()).raw() == 2147483647,
+    )
+    assert!(
+        Q15::minimum().sat_mul(other: Q15::minimum()).raw() == 2147483647,
+    )
+    assert!(Q15::minimum().sat_mul(other: one).raw() == -2147483648)
+    // rounding ties: +0.5 ulp rounds up, -0.5 ulp rounds toward +inf (to 0)
+    assert!(Q15::from_raw(raw: 1).sat_mul(other: half).raw() == 1)
+    assert!(Q15::from_raw(raw: -1).sat_mul(other: half).raw() == 0)
+    assert!(Q15::from_raw(raw: -3).sat_mul(other: half).raw() == -1)
+    // (1/3) * 1.0 stays 1/3
+    assert!(
+        Q15::from_ratio(num: 1, den: 3).sat_mul(other: one).raw() == 10923,
+    )
+    // Q31: just-below-1.0 squared stays just below 1.0
+    assert!(
+        Q31::maximum().sat_mul(other: Q31::maximum()).raw() == 2147483646,
+    )
+}
+
+#[test]
+fn sat_div() {
+    let one = Q15::one()
+    let two = Q15::from_int(x: 2)
+    let three = Q15::from_int(x: 3)
+    assert!(one.sat_div(other: two).raw() == 16384)
+    assert!(three.sat_div(other: two).raw() == 49152)
+    assert!(one.sat_div(other: Q15::zero()).raw() == 2147483647)
+    assert!(
+        one.sat_neg().sat_div(other: Q15::zero()).raw() == -2147483648,
+    )
+    assert!(Q15::zero().sat_div(other: Q15::zero()).raw() == 0)
+    assert!(
+        Q15::maximum().sat_div(other: Q15::from_raw(raw: 16384)).raw() == 2147483647,
+    )
+    // truncates toward zero: -1.0 / 3.0 = -0.333.. -> -10922 (not -10923)
+    assert!(one.sat_neg().sat_div(other: three).raw() == -10922)
+}
+
+#[test]
+fn scale_and_shifts() {
+    let half = Q15::from_raw(raw: 16384)
+    assert!(half.scale(gain: Q15::from_raw(raw: 16384)).raw() == 8192)
+    assert!(half.scale_int(factor: 3).raw() == 49152)
+    assert!(Q15::maximum().scale_int(factor: 2).raw() == 2147483647)
+    assert!(half.shr(n: 1).raw() == 8192)
+    assert!(half.sat_neg().shr(n: 1).raw() == -8192)
+    assert!(half.shr(n: 40).raw() == 0)
+    assert!(half.sat_neg().shr(n: 40).raw() == -1)
+    assert!(half.shl_sat(n: 1).raw() == 32768)
+    assert!(Q15::maximum().shl_sat(n: 1).raw() == 2147483647)
+    assert!(half.sat_neg().shl_sat(n: 40).raw() == -2147483648)
+    assert!(Q15::zero().shl_sat(n: 40).raw() == 0)
+}
+
+#[test]
+fn abs_neg_clamp_min_max() {
+    assert!(Q15::minimum().abs().raw() == 2147483647)
+    assert!(Q15::from_raw(raw: -5).abs().raw() == 5)
+    assert!(Q15::minimum().sat_neg().raw() == 2147483647)
+    assert!(Q15::from_raw(raw: 5).sat_neg().raw() == -5)
+    let lo = Q15::from_raw(raw: -100)
+    let hi = Q15::from_raw(raw: 100)
+    assert!(
+        Q15::from_raw(raw: -500).clamp(lo: lo, hi: hi).raw() == -100,
+    )
+    assert!(Q15::from_raw(raw: 500).clamp(lo: lo, hi: hi).raw() == 100)
+    assert!(Q15::from_raw(raw: 42).clamp(lo: lo, hi: hi).raw() == 42)
+    assert!(
+        Q15::from_raw(raw: 3).min(other: Q15::from_raw(raw: 9)).raw() == 3,
+    )
+    assert!(
+        Q15::from_raw(raw: 3).max(other: Q15::from_raw(raw: 9)).raw() == 9,
+    )
+}
+
+#[test]
+fn hann_tables() {
+    assert!(HANN16[0] == 0)
+    assert!(HANN16[15] == 0)
+    assert!(HANN16[7] == 32409)
+    assert!(HANN16[1] == 1416)
+    assert!(HANN16[14] == 1416)
+    assert!(sum_i32(a: HANN16) == 245752)
+    assert!(HANN32[0] == 0)
+    assert!(HANN32[31] == 0)
+    assert!(HANN32[15] == 32683)
+    assert!(sum_i32(a: HANN32) == 507890)
+    assert!(HANN64[0] == 0)
+    assert!(HANN64[63] == 0)
+    assert!(HANN64[31] == 32747)
+    assert!(sum_i32(a: HANN64) == 1032158)
+}
+
+#[test]
+fn dot_products() {
+    let a4: [Q15; 4] = [
+        Q15::from_raw(raw: 11905),
+        Q15::from_raw(raw: -22704),
+        Q15::from_raw(raw: -28361),
+        Q15::from_raw(raw: 18598),
+    ]
+    let b4: [Q15; 4] = [
+        Q15::from_raw(raw: -11976),
+        Q15::from_raw(raw: -13951),
+        Q15::from_raw(raw: -15372),
+        Q15::from_raw(raw: -20856),
+    ]
+    assert!(dot(a: a4, b: b4).raw() == 6783)
+    let a16: [Q15; 16] = [
+        Q15::from_raw(raw: 18265),
+        Q15::from_raw(raw: -23283),
+        Q15::from_raw(raw: 14348),
+        Q15::from_raw(raw: 18540),
+        Q15::from_raw(raw: 28469),
+        Q15::from_raw(raw: 5741),
+        Q15::from_raw(raw: -24303),
+        Q15::from_raw(raw: 8698),
+        Q15::from_raw(raw: -2349),
+        Q15::from_raw(raw: -27918),
+        Q15::from_raw(raw: -28048),
+        Q15::from_raw(raw: -23860),
+        Q15::from_raw(raw: -15672),
+        Q15::from_raw(raw: -14753),
+        Q15::from_raw(raw: 3118),
+        Q15::from_raw(raw: 9453),
+    ]
+    let b16: [Q15; 16] = [
+        Q15::from_raw(raw: -28261),
+        Q15::from_raw(raw: 6781),
+        Q15::from_raw(raw: -16969),
+        Q15::from_raw(raw: 16925),
+        Q15::from_raw(raw: 12590),
+        Q15::from_raw(raw: 15962),
+        Q15::from_raw(raw: 5713),
+        Q15::from_raw(raw: -2507),
+        Q15::from_raw(raw: -15554),
+        Q15::from_raw(raw: -561),
+        Q15::from_raw(raw: 8618),
+        Q15::from_raw(raw: -11769),
+        Q15::from_raw(raw: 23046),
+        Q15::from_raw(raw: 26970),
+        Q15::from_raw(raw: -29575),
+        Q15::from_raw(raw: 19729),
+    ]
+    assert!(dot(a: a16, b: b16).raw() == -27094)
+    let unit: [Q15; 4] = [Q15::from_raw(raw: 16384); 4]
+    assert!(dot(a: unit, b: unit).raw() == 32768)
+}
+
+#[test]
+fn demo_gain_stage() {
+    // 16-sample sine burst, 2 cycles, amplitude 0.9 (Q15 raw).
+    let burst: [Q15; 16] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+    ]
+    // Step 1: Hann window. Spot-check + sum check against the oracle.
+    let windowed = window(samples: burst, coeffs: HANN16)
+    assert!(windowed[0].raw() == 0)
+    assert!(windowed[1].raw() == 901)
+    assert!(windowed[2].raw() == 4879)
+    assert!(windowed[7].raw() == -20625)
+    assert!(windowed[15].raw() == 0)
+    let ones: [Q15; 16] = [Q15::one(); 16]
+    assert!(dot(a: windowed, b: ones).raw() == -2183)
+    // Step 2: 0.5 gain via a second window pass with a flat 0.5 table.
+    let half_table: [i32; 16] = [16384; 16]
+    let gained = window(samples: windowed, coeffs: half_table)
+    assert!(gained[1].raw() == 451)
+    assert!(gained[6].raw() == -13336)
+    // Step 3: signal energy = dot(gained, gained).
+    assert!(dot(a: gained, b: gained).raw() == 18684)
+}
+
+#[test]
+fn q0_plain_integers() {
+    assert!(Q<0>::from_int(x: 5).raw() == 5)
+    assert!(Q<0>::from_int(x: 5).to_int() == 5)
+    assert!(
+        Q<0>::from_raw(raw: 3).sat_mul(other: Q<0>::from_raw(raw: 4)).raw() == 12,
+    )
+    assert!(
+        Q<0>::from_raw(raw: 7).sat_add(other: Q<0>::from_raw(raw: -2)).raw() == 5,
+    )
+}
+
+#[test]
+fn dot_saturation() {
+    // v0.2.0 regression: 3+ maximum-magnitude elements used to revert
+    // (i64 accumulator overflow, panic 0x11). The saturating
+    // accumulator must return MAX / MIN instead, on both backends.
+    let max3: [Q15; 3] = [Q15::maximum(); 3]
+    let min3: [Q15; 3] = [Q15::minimum(); 3]
+    assert!(dot(a: max3, b: max3).raw() == 2147483647)
+    assert!(dot(a: min3, b: min3).raw() == 2147483647)
+    assert!(dot(a: max3, b: min3).raw() == -2147483648)
+    assert!(dot(a: min3, b: max3).raw() == -2147483648)
+    let max8: [Q15; 8] = [Q15::maximum(); 8]
+    let min8: [Q15; 8] = [Q15::minimum(); 8]
+    assert!(dot(a: max8, b: max8).raw() == 2147483647)
+    assert!(dot(a: min8, b: min8).raw() == 2147483647)
+    // Mixed signs, saturating both ways.
+    let mixed_a: [Q15; 4] = [
+        Q15::maximum(),
+        Q15::minimum(),
+        Q15::from_raw(raw: 16384),
+        Q15::from_raw(raw: -16384),
+    ]
+    let mixed_b: [Q15; 4] = [
+        Q15::from_raw(raw: 16384),
+        Q15::from_raw(raw: -16384),
+        Q15::maximum(),
+        Q15::minimum(),
+    ]
+    assert!(dot(a: mixed_a, b: mixed_b).raw() == 2147483647)
+}
+
+#[test]
+fn convert_q_formats() {
+    let half31: Q31 = convert_q(x: Q15::from_raw(raw: 16384))
+    assert!(half31.raw() == 1073741824)
+    let half7: Q7 = convert_q(x: Q15::from_raw(raw: 16384))
+    assert!(half7.raw() == 64)
+    let one15: Q15 = convert_q(x: Q7::from_raw(raw: 128))
+    assert!(one15.raw() == 32768)
+    let max15: Q15 = convert_q(x: Q31::maximum())
+    assert!(max15.raw() == 32768)
+    let min15: Q15 = convert_q(x: Q31::minimum())
+    assert!(min15.raw() == -32768)
+    let max7: Q7 = convert_q(x: Q15::maximum())
+    assert!(max7.raw() == 8388608)
+    let one7: Q7 = convert_q(x: Q15::one())
+    assert!(one7.raw() == 128)
+    // Rounding ties toward +inf, like sat_mul: +0.5 -> 1, -0.5 -> 0.
+    let raw1: Q7 = convert_q(x: Q15::from_raw(raw: 1))
+    assert!(raw1.raw() == 0)
+    let raw128: Q7 = convert_q(x: Q15::from_raw(raw: 128))
+    assert!(raw128.raw() == 1)
+    let neg128: Q7 = convert_q(x: Q15::from_raw(raw: -128))
+    assert!(neg128.raw() == 0)
+    let neg129: Q7 = convert_q(x: Q15::from_raw(raw: -129))
+    assert!(neg129.raw() == -1)
+    let neg1: Q7 = convert_q(x: Q15::from_raw(raw: -1))
+    assert!(neg1.raw() == 0)
+    // Q0 boundaries: integers in and out.
+    let five15: Q15 = convert_q(x: Q<0>::from_raw(raw: 5))
+    assert!(five15.raw() == 163840)
+    let five0: Q<0> = convert_q(x: Q15::from_raw(raw: 163840))
+    assert!(five0.raw() == 5)
+    let neg0: Q<0> = convert_q(x: Q15::from_raw(raw: -49152))
+    assert!(neg0.raw() == -1)
+    // 1.0 in Q31 saturates to maximum(); -1.0 in Q31 is minimum().
+    let one31: Q31 = convert_q(x: Q<0>::from_raw(raw: 1))
+    assert!(one31.raw() == 2147483647)
+    let max0: Q<0> = convert_q(x: Q31::maximum())
+    assert!(max0.raw() == 1)
+    let min0: Q<0> = convert_q(x: Q31::minimum())
+    assert!(min0.raw() == -1)
+    // Same format is the identity.
+    let same: Q15 = convert_q(x: Q15::from_raw(raw: -12345))
+    assert!(same.raw() == -12345)
+}
+
+#[test]
+fn window_tables_hamming_blackman() {
+    assert!(HAMMING16[0] == 2621)
+    assert!(HAMMING16[15] == 2621)
+    assert!(HAMMING16[7] == 32438)
+    assert!(HAMMING16[8] == 32438)
+    assert!(HAMMING16[1] == 3924)
+    assert!(HAMMING16[14] == 3924)
+    assert!(sum_i32(a: HAMMING16) == 268032)
+    assert!(HAMMING32[0] == 2621)
+    assert!(HAMMING32[31] == 2621)
+    assert!(HAMMING32[15] == 32690)
+    assert!(sum_i32(a: HAMMING32) == 551142)
+    assert!(HAMMING64[0] == 2621)
+    assert!(HAMMING64[63] == 2621)
+    assert!(HAMMING64[31] == 32748)
+    assert!(sum_i32(a: HAMMING64) == 1117352)
+    assert!(BLACKMAN16[0] == 0)
+    assert!(BLACKMAN16[15] == 0)
+    assert!(BLACKMAN16[7] == 32182)
+    assert!(BLACKMAN16[8] == 32182)
+    assert!(BLACKMAN16[1] == 549)
+    assert!(BLACKMAN16[14] == 549)
+    assert!(sum_i32(a: BLACKMAN16) == 206432)
+    assert!(BLACKMAN32[0] == 0)
+    assert!(BLACKMAN32[31] == 0)
+    assert!(BLACKMAN32[15] == 32629)
+    assert!(sum_i32(a: BLACKMAN32) == 426628)
+    assert!(BLACKMAN64[0] == 0)
+    assert!(BLACKMAN64[63] == 0)
+    assert!(BLACKMAN64[31] == 32734)
+    assert!(sum_i32(a: BLACKMAN64) == 867014)
+}
+
+#[test]
+fn frame_stats() {
+    // The demo sine burst, reused as a frame: symmetric, so mean is 0;
+    // RMS is 0.9 / sqrt(2) in Q15.
+    let burst: [Q15; 16] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+    ]
+    assert!(mean(x: burst).raw() == 0)
+    assert!(rms(x: burst).raw() == 20853)
+    assert!(energy(x: burst).raw() == 212324)
+    let const_frame: [Q15; 16] = [Q15::from_raw(raw: 16384); 16]
+    assert!(mean(x: const_frame).raw() == 16384)
+    assert!(rms(x: const_frame).raw() == 16384)
+    assert!(energy(x: const_frame).raw() == 131072)
+    // Rounding: ties toward +inf, like sat_mul. -1.5 -> -1, not -2.
+    assert!(
+        mean(x: [Q15::from_raw(raw: 1), Q15::from_raw(raw: 2)]).raw() == 2,
+    )
+    assert!(
+        mean(x: [Q15::from_raw(raw: -1), Q15::from_raw(raw: -2)]).raw() == -1,
+    )
+    assert!(
+        mean(x: [Q15::maximum(), Q15::maximum()]).raw() == 2147483647,
+    )
+    assert!(
+        mean(x: [Q15::minimum(), Q15::minimum()]).raw() == -2147483648,
+    )
+    assert!(mean(x: [Q15::maximum(), Q15::minimum()]).raw() == 0)
+    // RMS: constant frame returns |constant|; a single minimum saturates.
+    let half_zero: [Q15; 4] = [Q15::from_raw(raw: 16384), Q15::zero(), Q15::zero(), Q15::zero()]
+    assert!(rms(x: half_zero).raw() == 8192)
+    let full: [Q15; 4] = [Q15::one(); 4]
+    assert!(rms(x: full).raw() == 32768)
+    let min1: [Q15; 1] = [Q15::minimum()]
+    assert!(rms(x: min1).raw() == 2147483647)
+    let zero4: [Q15; 4] = [Q15::zero(); 4]
+    assert!(rms(x: zero4).raw() == 0)
+    let unit4: [Q15; 4] = [Q15::from_raw(raw: 16384); 4]
+    assert!(energy(x: unit4).raw() == 32768)
+}
+
+#[test]
+fn sqrt_reciprocal() {
+    // Square roots: exact cases, rounding, edges.
+    assert!(Q15::one().sqrt().raw() == 32768)
+    assert!(Q15::from_raw(raw: 8192).sqrt().raw() == 16384)
+    assert!(Q15::from_raw(raw: 16384).sqrt().raw() == 23170)
+    assert!(Q15::from_raw(raw: 65536).sqrt().raw() == 46341)
+    assert!(Q15::from_raw(raw: 131072).sqrt().raw() == 65536)
+    assert!(Q15::zero().sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -32768).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: 2949).sqrt().raw() == 9830)
+    assert!(Q15::maximum().sqrt().raw() == 8388608)
+    assert!(Q31::maximum().sqrt().raw() == 2147483647)
+    assert!(Q31::from_raw(raw: 1073741824).sqrt().raw() == 1518500250)
+    assert!(Q7::from_raw(raw: 512).sqrt().raw() == 256)
+    assert!(Q7::from_raw(raw: 256).sqrt().raw() == 181)
+    assert!(Q<0>::from_raw(raw: 16).sqrt().raw() == 4)
+    assert!(Q<0>::from_raw(raw: 2).sqrt().raw() == 1)
+    assert!(Q<0>::zero().sqrt().raw() == 0)
+    // Reciprocals: exact cases, edges, saturation branches.
+    assert!(Q15::one().reciprocal().raw() == 32768)
+    assert!(Q15::from_raw(raw: 16384).reciprocal().raw() == 65535)
+    assert!(Q15::from_raw(raw: 65536).reciprocal().raw() == 16384)
+    assert!(Q15::zero().reciprocal().raw() == 2147483647)
+    assert!(Q15::from_raw(raw: -65536).reciprocal().raw() == -16384)
+    assert!(Q15::from_raw(raw: 10923).reciprocal().raw() == 98302)
+    assert!(Q15::from_raw(raw: 98304).reciprocal().raw() == 10923)
+    assert!(Q15::from_raw(raw: 8192).reciprocal().raw() == 131070)
+    assert!(Q15::from_raw(raw: 1).reciprocal().raw() == 1073725440)
+    assert!(Q15::from_raw(raw: 2).reciprocal().raw() == 536862720)
+    assert!(Q15::from_raw(raw: 7).reciprocal().raw() == 153391104)
+    assert!(Q15::maximum().reciprocal().raw() == 1)
+    assert!(Q15::minimum().reciprocal().raw() == 0)
+    assert!(Q15::from_raw(raw: -1).reciprocal().raw() == -1073725440)
+    assert!(Q7::from_raw(raw: 256).reciprocal().raw() == 64)
+    assert!(Q7::from_raw(raw: 64).reciprocal().raw() == 255)
+    assert!(Q7::from_raw(raw: 128).reciprocal().raw() == 128)
+    // Q31: every reciprocal is unrepresentable, so it saturates.
+    assert!(Q31::maximum().reciprocal().raw() == 2147483647)
+    assert!(Q31::minimum().reciprocal().raw() == -2147483648)
+    assert!(
+        Q31::from_raw(raw: 1073741824).reciprocal().raw() == 2147483647,
+    )
+    // Q0: truncated integer reciprocal.
+    assert!(Q<0>::from_raw(raw: 5).reciprocal().raw() == 0)
+    assert!(Q<0>::from_raw(raw: 1).reciprocal().raw() == 1)
+    assert!(Q<0>::from_raw(raw: -1).reciprocal().raw() == -1)
+    assert!(Q<0>::zero().reciprocal().raw() == 2147483647)
+}
+
+#[test]
+fn biquad_filter() {
+    // Gain-only biquad (b0 = 0.5, rest 0): pure scaling, state stays 0.
+    var gain = Biquad::new(
+        b0: Q15::from_raw(raw: 16384),
+        b1: Q15::zero(),
+        b2: Q15::zero(),
+        a1: Q15::zero(),
+        a2: Q15::zero(),
+    )
+    let impulse_gain = run_biquad(
+        bq: mut gain,
+        xs: [Q15::one(), Q15::zero(), Q15::zero(), Q15::zero()],
+    )
+    assert_q15_frame(got: impulse_gain, want: [16384, 0, 0, 0])
+    let step_gain = run_biquad(
+        bq: mut gain,
+        xs: [Q15::one(), Q15::one(), Q15::one(), Q15::one()],
+    )
+    assert_q15_frame(got: step_gain, want: [16384, 16384, 16384, 16384])
+    // Butterworth lowpass (fc = 0.1 fs): impulse and step responses.
+    var lp = Biquad::lowpass_01()
+    let impulse = run_biquad(
+        bq: mut lp,
+        xs: [
+            Q15::one(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+        ],
+    )
+    assert_q15_frame(
+        got: impulse,
+        want: [2210, 6947, 9238, 7691, 4977, 2514, 818, -103],
+    )
+    var lp2 = Biquad::lowpass_01()
+    let step_resp = run_biquad(bq: mut lp2, xs: [Q15::one(); 16])
+    assert_q15_frame(
+        got: step_resp,
+        want: [
+            2210,
+            9157,
+            18395,
+            26086,
+            31063,
+            33576,
+            34395,
+            34293,
+            33838,
+            33360,
+            33002,
+            32790,
+            32695,
+            32675,
+            32691,
+            32717,
+        ],
+    )
+    // Reset: after running, the state clears and the filter restarts.
+    var ran = Biquad::lowpass_01()
+    let _y1 = ran.step(x: Q15::one())
+    let _y2 = ran.step(x: Q15::one())
+    ran.reset()
+    assert!(ran.step(x: Q15::zero()).raw() == 0)
+    ran.reset()
+    assert!(ran.step(x: Q15::one()).raw() == 2210)
+}
+
+#[test]
+fn fir_filter() {
+    // 4-tap moving average: impulse response is the taps; a constant
+    // input settles at the input value.
+    var ma = Fir::new(
+        taps: [
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+        ],
+    )
+    let impulse = run_fir(
+        fir: mut ma,
+        xs: [Q15::one(), Q15::zero(), Q15::zero(), Q15::zero(), Q15::zero(), Q15::zero()],
+    )
+    assert_q15_frame(got: impulse, want: [8192, 8192, 8192, 8192, 0, 0])
+    var ma2 = Fir::new(
+        taps: [
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+        ],
+    )
+    let step_resp = run_fir(fir: mut ma2, xs: [Q15::one(); 6])
+    assert_q15_frame(
+        got: step_resp,
+        want: [8192, 16384, 24576, 32768, 32768, 32768],
+    )
+    var ma3 = Fir::new(
+        taps: [
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+        ],
+    )
+    let const_resp = run_fir(fir: mut ma3, xs: [Q15::from_raw(raw: 16384); 6])
+    assert_q15_frame(
+        got: const_resp,
+        want: [4096, 8192, 12288, 16384, 16384, 16384],
+    )
+    // Random 8 taps (oracle seed 7): impulse response is the taps.
+    let taps8: [Q15; 8] = [
+        Q15::from_raw(raw: -8778),
+        Q15::from_raw(raw: -20114),
+        Q15::from_raw(raw: -4125),
+        Q15::from_raw(raw: 12659),
+        Q15::from_raw(raw: -26836),
+        Q15::from_raw(raw: -25253),
+        Q15::from_raw(raw: 23823),
+        Q15::from_raw(raw: 5119),
+    ]
+    var fir8 = Fir::new(taps: taps8)
+    let impulse8 = run_fir(
+        fir: mut fir8,
+        xs: [
+            Q15::one(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+            Q15::zero(),
+        ],
+    )
+    assert_q15_frame(
+        got: impulse8,
+        want: [-8778, -20114, -4125, 12659, -26836, -25253, 23823, 5119, 0, 0],
+    )
+    var fir8b = Fir::new(taps: taps8)
+    let step8 = run_fir(fir: mut fir8b, xs: [Q15::one(); 10])
+    assert_q15_frame(
+        got: step8,
+        want: [-8778, -28892, -33017, -20358, -47194, -72447, -48624, -43505, -43505, -43505],
+    )
+    // Reset clears the delay line.
+    var ran = Fir::new(taps: taps8)
+    let _y1 = ran.step(x: Q15::one())
+    ran.reset()
+    assert!(ran.step(x: Q15::zero()).raw() == 0)
+    ran.reset()
+    assert!(ran.step(x: Q15::one()).raw() == -8778)
+}
+
+#[test]
+fn cplx_arithmetic() {
+    let half = Cplx::new(
+        re: Q15::from_raw(raw: 16384),
+        im: Q15::from_raw(raw: 16384),
+    )
+    // (0.5 + 0.5i)^2 = 0 + 0.5i.
+    let sq = half.mul(other: half)
+    assert!(sq.re().raw() == 0)
+    assert!(sq.im().raw() == 16384)
+    // Conjugate flips the imaginary part.
+    let cj = half.conj()
+    assert!(cj.re().raw() == 16384)
+    assert!(cj.im().raw() == -16384)
+    // |0.6 + 0.8i| = 1.0 (Q15 raws 19661 and 26214).
+    let v = Cplx::new(
+        re: Q15::from_raw(raw: 19661),
+        im: Q15::from_raw(raw: 26214),
+    )
+    assert!(v.magnitude().raw() == 32768)
+    // |0.5 + 0.5i|^2 = 0.5.
+    assert!(half.magnitude_squared().raw() == 16384)
+    assert!(Cplx::from_re(re: Q15::one()).magnitude().raw() == 32768)
+    assert!(Cplx::zero().magnitude().raw() == 0)
+    // Add / sub, componentwise and saturating.
+    let a = Cplx::new(
+        re: Q15::from_raw(raw: 16384),
+        im: Q15::from_raw(raw: -16384),
+    )
+    let b = Cplx::new(
+        re: Q15::from_raw(raw: 8192),
+        im: Q15::from_raw(raw: 16384),
+    )
+    let s = a.add(other: b)
+    assert!(s.re().raw() == 24576)
+    assert!(s.im().raw() == 0)
+    let d = a.sub(other: b)
+    assert!(d.re().raw() == 8192)
+    assert!(d.im().raw() == -32768)
+    // conj of an i32::MIN imaginary part saturates to maximum().
+    let mn = Cplx::new(re: Q15::zero(), im: Q15::minimum())
+    assert!(mn.conj().im().raw() == 2147483647)
+}
+
+#[test]
+fn fft16_transform() {
+    // Impulse -> flat spectrum: every bin is 1.0 + 0i.
+    let spec_imp = fft16(x: impulse_cplx())
+    assert_cplx_frame(
+        got: spec_imp,
+        want_re: [
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+            32768,
+        ],
+        want_im: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    )
+    // DC -> bin 0 is the sum (16 * 1.0), everything else zero.
+    let spec_dc = fft16(x: dc_cplx())
+    assert_cplx_frame(
+        got: spec_dc,
+        want_re: [524288, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        want_im: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    )
+    // One-cycle sine (0.9 amplitude): peaks at bins 1 and 15, magnitude
+    // N/2 * 0.9 = 7.2 (Q15 raw 235919); every other bin is ~0.
+    let sine1: [Q15; 16] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -11285),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -11285),
+    ]
+    let spec1 = fft16(x: to_cplx(xs: sine1))
+    assert_cplx_frame(
+        got: spec1,
+        want_re: [0, -1, 0, 2, 0, -2, 0, 1, 0, 1, 0, -2, 0, 2, 0, -1],
+        want_im: [0, -235919, 0, 1, 0, 1, 0, 1, 0, -1, 0, -1, 0, -1, 0, 235919],
+    )
+    assert_q15_frame(
+        got: fft_magnitude(x: spec1),
+        want: [0, 235919, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 235919],
+    )
+    // Two-cycle sine: peaks at bins 2 and 14.
+    let sine2: [Q15; 16] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+    ]
+    let spec2 = fft16(x: to_cplx(xs: sine2))
+    assert_cplx_frame(
+        got: spec2,
+        want_re: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+        want_im: [0, 0, -235920, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 235920, 0],
+    )
+    // Random complex frame (oracle seed 99): every bin pinned.
+    let rnd: [Cplx; 16] = [
+        Cplx::new(
+            re: Q15::from_raw(raw: -3525),
+            im: Q15::from_raw(raw: -5047),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16888),
+            im: Q15::from_raw(raw: 9284),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18283),
+            im: Q15::from_raw(raw: -14910),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13719),
+            im: Q15::from_raw(raw: -21268),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 19799),
+            im: Q15::from_raw(raw: -24326),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13541),
+            im: Q15::from_raw(raw: 17777),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -4896),
+            im: Q15::from_raw(raw: 4787),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 14846),
+            im: Q15::from_raw(raw: 15907),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 5299),
+            im: Q15::from_raw(raw: -24113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 10889),
+            im: Q15::from_raw(raw: 2065),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16928),
+            im: Q15::from_raw(raw: -2368),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 17331),
+            im: Q15::from_raw(raw: 10187),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 8561),
+            im: Q15::from_raw(raw: -15799),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21944),
+            im: Q15::from_raw(raw: 29113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21663),
+            im: Q15::from_raw(raw: -5491),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 23891),
+            im: Q15::from_raw(raw: -4565),
+        ),
+    ]
+    let spec_r = fft16(x: rnd)
+    assert_cplx_frame(
+        got: spec_r,
+        want_re: [
+            56443,
+            -45677,
+            -69493,
+            10973,
+            106556,
+            19654,
+            -65651,
+            5797,
+            -33063,
+            43415,
+            -16827,
+            -50411,
+            -9400,
+            -86796,
+            45627,
+            32453,
+        ],
+        want_im: [
+            -28767,
+            67050,
+            88688,
+            88251,
+            -11358,
+            -733,
+            3282,
+            89935,
+            -145767,
+            -44190,
+            37198,
+            44105,
+            -91248,
+            9185,
+            -85308,
+            -101075,
+        ],
+    )
+    // Parseval: sum |X|^2 == 16 * sum |x|^2 within rounding (oracle
+    // measures ~2e-5 relative; the bound is 1e-3).
+    assert_parseval(x: sine1, spec: spec1)
+    assert_parseval_cplx(x: rnd, spec: spec_r)
+}
+
+#[test]
+fn fft32_transform() {
+    // Impulse -> flat spectrum; DC -> bin 0 is the sum (32 * 1.0).
+    let spec_imp = fft32(x: impulse_cplx())
+    assert!(spec_imp[0].re().raw() == 32768)
+    assert!(spec_imp[31].re().raw() == 32768)
+    assert!(spec_imp[17].im().raw() == 0)
+    let spec_dc = fft32(x: dc_cplx())
+    assert!(spec_dc[0].re().raw() == 1048576)
+    assert!(spec_dc[1].re().raw() == 0)
+    assert!(spec_dc[1].im().raw() == 0)
+    // One-cycle sine: peaks at bins 1 and 31, magnitude 471839.
+    let sine1: [Q15; 32] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 5753),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 16384),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 24520),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 28924),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 28924),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 24520),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 16384),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 5753),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -5753),
+        Q15::from_raw(raw: -11285),
+        Q15::from_raw(raw: -16384),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -24520),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -28924),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -28924),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -24520),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -16384),
+        Q15::from_raw(raw: -11285),
+        Q15::from_raw(raw: -5753),
+    ]
+    let spec1 = fft32(x: to_cplx(xs: sine1))
+    assert_q15_frame(
+        got: fft_magnitude(x: spec1),
+        want: [
+            0,
+            471839,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            471839,
+        ],
+    )
+    assert!(spec1[1].im().raw() == -471839)
+    assert!(spec1[31].im().raw() == 471839)
+    assert!(spec1[0].re().raw() == 0)
+    // Random complex frame: spot-check bins 0, 1, 7, 17, 28.
+    let rnd: [Cplx; 32] = [
+        Cplx::new(
+            re: Q15::from_raw(raw: -3525),
+            im: Q15::from_raw(raw: -5047),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16888),
+            im: Q15::from_raw(raw: 9284),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18283),
+            im: Q15::from_raw(raw: -14910),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13719),
+            im: Q15::from_raw(raw: -21268),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 19799),
+            im: Q15::from_raw(raw: -24326),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13541),
+            im: Q15::from_raw(raw: 17777),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -4896),
+            im: Q15::from_raw(raw: 4787),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 14846),
+            im: Q15::from_raw(raw: 15907),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 5299),
+            im: Q15::from_raw(raw: -24113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 10889),
+            im: Q15::from_raw(raw: 2065),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16928),
+            im: Q15::from_raw(raw: -2368),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 17331),
+            im: Q15::from_raw(raw: 10187),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 8561),
+            im: Q15::from_raw(raw: -15799),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21944),
+            im: Q15::from_raw(raw: 29113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21663),
+            im: Q15::from_raw(raw: -5491),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 23891),
+            im: Q15::from_raw(raw: -4565),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 26458),
+            im: Q15::from_raw(raw: 14719),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16068),
+            im: Q15::from_raw(raw: -20021),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 243),
+            im: Q15::from_raw(raw: 13290),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18269),
+            im: Q15::from_raw(raw: 25703),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 7153),
+            im: Q15::from_raw(raw: -7796),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -24563),
+            im: Q15::from_raw(raw: 16968),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 4649),
+            im: Q15::from_raw(raw: 14392),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 20755),
+            im: Q15::from_raw(raw: -24246),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 738),
+            im: Q15::from_raw(raw: -9266),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -3614),
+            im: Q15::from_raw(raw: -27205),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -12345),
+            im: Q15::from_raw(raw: 6565),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -29501),
+            im: Q15::from_raw(raw: -2134),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16647),
+            im: Q15::from_raw(raw: -6242),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 5016),
+            im: Q15::from_raw(raw: -24704),
+        ),
+        Cplx::new(re: Q15::from_raw(raw: 283), im: Q15::from_raw(raw: 3990)),
+        Cplx::new(
+            re: Q15::from_raw(raw: 28998),
+            im: Q15::from_raw(raw: -17019),
+        ),
+    ]
+    let spec_r = fft32(x: rnd)
+    assert!(spec_r[0].re().raw() == 29729)
+    assert!(spec_r[0].im().raw() == -71773)
+    assert!(spec_r[1].re().raw() == -81485)
+    assert!(spec_r[1].im().raw() == -200471)
+    assert!(spec_r[7].re().raw() == 28620)
+    assert!(spec_r[7].im().raw() == 68386)
+    assert!(spec_r[17].re().raw() == -203461)
+    assert!(spec_r[17].im().raw() == 77241)
+    assert!(spec_r[28].re().raw() == 131786)
+    assert!(spec_r[28].im().raw() == -225671)
+    assert_parseval(x: sine1, spec: spec1)
+}
+
+#[test]
+fn fft64_transform() {
+    // Impulse -> flat spectrum; DC -> bin 0 is the sum (64 * 1.0).
+    let spec_imp = fft64(x: impulse_cplx())
+    assert!(spec_imp[0].re().raw() == 32768)
+    assert!(spec_imp[63].re().raw() == 32768)
+    assert!(spec_imp[40].im().raw() == 0)
+    let spec_dc = fft64(x: dc_cplx())
+    assert!(spec_dc[0].re().raw() == 2097152)
+    assert!(spec_dc[1].re().raw() == 0)
+    assert!(spec_dc[1].im().raw() == 0)
+    // One-cycle sine: peaks at bins 1 and 63, magnitude 943673.
+    let sine1: [Q15; 64] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 2891),
+        Q15::from_raw(raw: 5753),
+        Q15::from_raw(raw: 8561),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 13902),
+        Q15::from_raw(raw: 16384),
+        Q15::from_raw(raw: 18708),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 22796),
+        Q15::from_raw(raw: 24520),
+        Q15::from_raw(raw: 26008),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 28220),
+        Q15::from_raw(raw: 28924),
+        Q15::from_raw(raw: 29348),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 29348),
+        Q15::from_raw(raw: 28924),
+        Q15::from_raw(raw: 28220),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 26008),
+        Q15::from_raw(raw: 24520),
+        Q15::from_raw(raw: 22796),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 18708),
+        Q15::from_raw(raw: 16384),
+        Q15::from_raw(raw: 13902),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 8561),
+        Q15::from_raw(raw: 5753),
+        Q15::from_raw(raw: 2891),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -2891),
+        Q15::from_raw(raw: -5753),
+        Q15::from_raw(raw: -8561),
+        Q15::from_raw(raw: -11285),
+        Q15::from_raw(raw: -13902),
+        Q15::from_raw(raw: -16384),
+        Q15::from_raw(raw: -18708),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -22796),
+        Q15::from_raw(raw: -24520),
+        Q15::from_raw(raw: -26008),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -28220),
+        Q15::from_raw(raw: -28924),
+        Q15::from_raw(raw: -29348),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -29348),
+        Q15::from_raw(raw: -28924),
+        Q15::from_raw(raw: -28220),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -26008),
+        Q15::from_raw(raw: -24520),
+        Q15::from_raw(raw: -22796),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -18708),
+        Q15::from_raw(raw: -16384),
+        Q15::from_raw(raw: -13902),
+        Q15::from_raw(raw: -11285),
+        Q15::from_raw(raw: -8561),
+        Q15::from_raw(raw: -5753),
+        Q15::from_raw(raw: -2891),
+    ]
+    let spec1 = fft64(x: to_cplx(xs: sine1))
+    assert_q15_frame(
+        got: fft_magnitude(x: spec1),
+        want: [
+            0,
+            943673,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            943673,
+        ],
+    )
+    assert!(spec1[1].im().raw() == -943673)
+    assert!(spec1[63].im().raw() == 943673)
+    // Random complex frame: spot-check bins 0, 1, 10, 33, 52.
+    let rnd: [Cplx; 64] = [
+        Cplx::new(
+            re: Q15::from_raw(raw: -3525),
+            im: Q15::from_raw(raw: -5047),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16888),
+            im: Q15::from_raw(raw: 9284),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18283),
+            im: Q15::from_raw(raw: -14910),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13719),
+            im: Q15::from_raw(raw: -21268),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 19799),
+            im: Q15::from_raw(raw: -24326),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13541),
+            im: Q15::from_raw(raw: 17777),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -4896),
+            im: Q15::from_raw(raw: 4787),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 14846),
+            im: Q15::from_raw(raw: 15907),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 5299),
+            im: Q15::from_raw(raw: -24113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 10889),
+            im: Q15::from_raw(raw: 2065),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16928),
+            im: Q15::from_raw(raw: -2368),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 17331),
+            im: Q15::from_raw(raw: 10187),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 8561),
+            im: Q15::from_raw(raw: -15799),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21944),
+            im: Q15::from_raw(raw: 29113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21663),
+            im: Q15::from_raw(raw: -5491),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 23891),
+            im: Q15::from_raw(raw: -4565),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 26458),
+            im: Q15::from_raw(raw: 14719),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16068),
+            im: Q15::from_raw(raw: -20021),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 243),
+            im: Q15::from_raw(raw: 13290),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18269),
+            im: Q15::from_raw(raw: 25703),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 7153),
+            im: Q15::from_raw(raw: -7796),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -24563),
+            im: Q15::from_raw(raw: 16968),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 4649),
+            im: Q15::from_raw(raw: 14392),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 20755),
+            im: Q15::from_raw(raw: -24246),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 738),
+            im: Q15::from_raw(raw: -9266),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -3614),
+            im: Q15::from_raw(raw: -27205),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -12345),
+            im: Q15::from_raw(raw: 6565),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -29501),
+            im: Q15::from_raw(raw: -2134),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16647),
+            im: Q15::from_raw(raw: -6242),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 5016),
+            im: Q15::from_raw(raw: -24704),
+        ),
+        Cplx::new(re: Q15::from_raw(raw: 283), im: Q15::from_raw(raw: 3990)),
+        Cplx::new(
+            re: Q15::from_raw(raw: 28998),
+            im: Q15::from_raw(raw: -17019),
+        ),
+        Cplx::new(re: Q15::from_raw(raw: 9682), im: Q15::from_raw(raw: 323)),
+        Cplx::new(
+            re: Q15::from_raw(raw: -26637),
+            im: Q15::from_raw(raw: -6570),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -21537),
+            im: Q15::from_raw(raw: -15856),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 16867),
+            im: Q15::from_raw(raw: -19462),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 18988),
+            im: Q15::from_raw(raw: 21893),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -1052),
+            im: Q15::from_raw(raw: 9021),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18360),
+            im: Q15::from_raw(raw: 2977),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 13273),
+            im: Q15::from_raw(raw: -18465),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -27572),
+            im: Q15::from_raw(raw: -22805),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -28473),
+            im: Q15::from_raw(raw: -18782),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 1046),
+            im: Q15::from_raw(raw: 14817),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 23717),
+            im: Q15::from_raw(raw: -2539),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -24682),
+            im: Q15::from_raw(raw: -2120),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 11419),
+            im: Q15::from_raw(raw: -24363),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -20635),
+            im: Q15::from_raw(raw: -9697),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 10461),
+            im: Q15::from_raw(raw: -29629),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -5027),
+            im: Q15::from_raw(raw: -8393),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -21100),
+            im: Q15::from_raw(raw: 4301),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -3437),
+            im: Q15::from_raw(raw: -16841),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 28980),
+            im: Q15::from_raw(raw: 21590),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -26370),
+            im: Q15::from_raw(raw: 11971),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16144),
+            im: Q15::from_raw(raw: -970),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13120),
+            im: Q15::from_raw(raw: 5747),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -3520),
+            im: Q15::from_raw(raw: 24075),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 20056),
+            im: Q15::from_raw(raw: -21720),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -6813),
+            im: Q15::from_raw(raw: 15547),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 1204),
+            im: Q15::from_raw(raw: -26342),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -21420),
+            im: Q15::from_raw(raw: 18401),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 26618),
+            im: Q15::from_raw(raw: 17078),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 9299),
+            im: Q15::from_raw(raw: 21048),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 18969),
+            im: Q15::from_raw(raw: -20141),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 9848),
+            im: Q15::from_raw(raw: -3242),
+        ),
+    ]
+    let spec_r = fft64(x: rnd)
+    assert!(spec_r[0].re().raw() == -35743)
+    assert!(spec_r[0].im().raw() == -150921)
+    assert!(spec_r[1].re().raw() == 145836)
+    assert!(spec_r[1].im().raw() == -18125)
+    assert!(spec_r[10].re().raw() == -90598)
+    assert!(spec_r[10].im().raw() == 290800)
+    assert!(spec_r[33].re().raw() == 94562)
+    assert!(spec_r[33].im().raw() == -442477)
+    assert!(spec_r[52].re().raw() == -189620)
+    assert!(spec_r[52].im().raw() == 63254)
+    assert_parseval(x: sine1, spec: spec1)
+    assert_parseval_cplx(x: rnd, spec: spec_r)
+}
+
+#[test]
+fn ifft_roundtrip() {
+    // Forward then inverse returns the original within 1 ulp (the
+    // oracle pins the exact round-tripped values, including the 1-ulp
+    // rounding steps).
+    let sine16: [Q15; 16] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -11285),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -11285),
+    ]
+    let back16 = ifft16(x: fft16(x: to_cplx(xs: sine16)))
+    assert_cplx_frame(
+        got: back16,
+        want_re: [
+            0,
+            11285,
+            20852,
+            27245,
+            29490,
+            27246,
+            20852,
+            11285,
+            0,
+            -11285,
+            -20852,
+            -27245,
+            -29490,
+            -27246,
+            -20852,
+            -11285,
+        ],
+        want_im: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    )
+    let rnd16: [Cplx; 16] = [
+        Cplx::new(
+            re: Q15::from_raw(raw: -3525),
+            im: Q15::from_raw(raw: -5047),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16888),
+            im: Q15::from_raw(raw: 9284),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18283),
+            im: Q15::from_raw(raw: -14910),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13719),
+            im: Q15::from_raw(raw: -21268),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 19799),
+            im: Q15::from_raw(raw: -24326),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13541),
+            im: Q15::from_raw(raw: 17777),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -4896),
+            im: Q15::from_raw(raw: 4787),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 14846),
+            im: Q15::from_raw(raw: 15907),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 5299),
+            im: Q15::from_raw(raw: -24113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 10889),
+            im: Q15::from_raw(raw: 2065),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16928),
+            im: Q15::from_raw(raw: -2368),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 17331),
+            im: Q15::from_raw(raw: 10187),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 8561),
+            im: Q15::from_raw(raw: -15799),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21944),
+            im: Q15::from_raw(raw: 29113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21663),
+            im: Q15::from_raw(raw: -5491),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 23891),
+            im: Q15::from_raw(raw: -4565),
+        ),
+    ]
+    let back_r16 = ifft16(x: fft16(x: rnd16))
+    assert_cplx_frame(
+        got: back_r16,
+        want_re: [
+            -3525,
+            -16888,
+            -18283,
+            -13719,
+            19799,
+            -13542,
+            -4895,
+            14846,
+            5299,
+            10889,
+            -16928,
+            17331,
+            8561,
+            21944,
+            21662,
+            23890,
+        ],
+        want_im: [
+            -5047,
+            9285,
+            -14910,
+            -21268,
+            -24326,
+            17776,
+            4787,
+            15907,
+            -24113,
+            2065,
+            -2368,
+            10187,
+            -15799,
+            29113,
+            -5491,
+            -4565,
+        ],
+    )
+    let sine32: [Q15; 32] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 5753),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 16384),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 24520),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 28924),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 28924),
+        Q15::from_raw(raw: 27245),
+        Q15::from_raw(raw: 24520),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 16384),
+        Q15::from_raw(raw: 11285),
+        Q15::from_raw(raw: 5753),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -5753),
+        Q15::from_raw(raw: -11285),
+        Q15::from_raw(raw: -16384),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -24520),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -28924),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -28924),
+        Q15::from_raw(raw: -27245),
+        Q15::from_raw(raw: -24520),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -16384),
+        Q15::from_raw(raw: -11285),
+        Q15::from_raw(raw: -5753),
+    ]
+    let back32 = ifft32(x: fft32(x: to_cplx(xs: sine32)))
+    assert_cplx_frame(
+        got: back32,
+        want_re: [
+            0,
+            5752,
+            11285,
+            16384,
+            20852,
+            24519,
+            27245,
+            28923,
+            29490,
+            28924,
+            27246,
+            24520,
+            20852,
+            16384,
+            11285,
+            5753,
+            0,
+            -5752,
+            -11285,
+            -16384,
+            -20852,
+            -24519,
+            -27245,
+            -28923,
+            -29490,
+            -28924,
+            -27246,
+            -24520,
+            -20852,
+            -16384,
+            -11285,
+            -5753,
+        ],
+        want_im: [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ],
+    )
+    let rnd64: [Cplx; 64] = [
+        Cplx::new(
+            re: Q15::from_raw(raw: -3525),
+            im: Q15::from_raw(raw: -5047),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16888),
+            im: Q15::from_raw(raw: 9284),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18283),
+            im: Q15::from_raw(raw: -14910),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13719),
+            im: Q15::from_raw(raw: -21268),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 19799),
+            im: Q15::from_raw(raw: -24326),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13541),
+            im: Q15::from_raw(raw: 17777),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -4896),
+            im: Q15::from_raw(raw: 4787),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 14846),
+            im: Q15::from_raw(raw: 15907),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 5299),
+            im: Q15::from_raw(raw: -24113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 10889),
+            im: Q15::from_raw(raw: 2065),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16928),
+            im: Q15::from_raw(raw: -2368),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 17331),
+            im: Q15::from_raw(raw: 10187),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 8561),
+            im: Q15::from_raw(raw: -15799),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21944),
+            im: Q15::from_raw(raw: 29113),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 21663),
+            im: Q15::from_raw(raw: -5491),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 23891),
+            im: Q15::from_raw(raw: -4565),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 26458),
+            im: Q15::from_raw(raw: 14719),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16068),
+            im: Q15::from_raw(raw: -20021),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 243),
+            im: Q15::from_raw(raw: 13290),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18269),
+            im: Q15::from_raw(raw: 25703),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 7153),
+            im: Q15::from_raw(raw: -7796),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -24563),
+            im: Q15::from_raw(raw: 16968),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 4649),
+            im: Q15::from_raw(raw: 14392),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 20755),
+            im: Q15::from_raw(raw: -24246),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 738),
+            im: Q15::from_raw(raw: -9266),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -3614),
+            im: Q15::from_raw(raw: -27205),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -12345),
+            im: Q15::from_raw(raw: 6565),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -29501),
+            im: Q15::from_raw(raw: -2134),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16647),
+            im: Q15::from_raw(raw: -6242),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 5016),
+            im: Q15::from_raw(raw: -24704),
+        ),
+        Cplx::new(re: Q15::from_raw(raw: 283), im: Q15::from_raw(raw: 3990)),
+        Cplx::new(
+            re: Q15::from_raw(raw: 28998),
+            im: Q15::from_raw(raw: -17019),
+        ),
+        Cplx::new(re: Q15::from_raw(raw: 9682), im: Q15::from_raw(raw: 323)),
+        Cplx::new(
+            re: Q15::from_raw(raw: -26637),
+            im: Q15::from_raw(raw: -6570),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -21537),
+            im: Q15::from_raw(raw: -15856),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 16867),
+            im: Q15::from_raw(raw: -19462),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 18988),
+            im: Q15::from_raw(raw: 21893),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -1052),
+            im: Q15::from_raw(raw: 9021),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -18360),
+            im: Q15::from_raw(raw: 2977),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 13273),
+            im: Q15::from_raw(raw: -18465),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -27572),
+            im: Q15::from_raw(raw: -22805),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -28473),
+            im: Q15::from_raw(raw: -18782),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 1046),
+            im: Q15::from_raw(raw: 14817),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 23717),
+            im: Q15::from_raw(raw: -2539),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -24682),
+            im: Q15::from_raw(raw: -2120),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 11419),
+            im: Q15::from_raw(raw: -24363),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -20635),
+            im: Q15::from_raw(raw: -9697),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 10461),
+            im: Q15::from_raw(raw: -29629),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -5027),
+            im: Q15::from_raw(raw: -8393),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -21100),
+            im: Q15::from_raw(raw: 4301),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -3437),
+            im: Q15::from_raw(raw: -16841),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 28980),
+            im: Q15::from_raw(raw: 21590),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -26370),
+            im: Q15::from_raw(raw: 11971),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -16144),
+            im: Q15::from_raw(raw: -970),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -13120),
+            im: Q15::from_raw(raw: 5747),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -3520),
+            im: Q15::from_raw(raw: 24075),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 20056),
+            im: Q15::from_raw(raw: -21720),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -6813),
+            im: Q15::from_raw(raw: 15547),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 1204),
+            im: Q15::from_raw(raw: -26342),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: -21420),
+            im: Q15::from_raw(raw: 18401),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 26618),
+            im: Q15::from_raw(raw: 17078),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 9299),
+            im: Q15::from_raw(raw: 21048),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 18969),
+            im: Q15::from_raw(raw: -20141),
+        ),
+        Cplx::new(
+            re: Q15::from_raw(raw: 9848),
+            im: Q15::from_raw(raw: -3242),
+        ),
+    ]
+    let back_r64 = ifft64(x: fft64(x: rnd64))
+    assert_cplx_frame(
+        got: back_r64,
+        want_re: [
+            -3525,
+            -16888,
+            -18283,
+            -13719,
+            19798,
+            -13542,
+            -4896,
+            14845,
+            5298,
+            10889,
+            -16928,
+            17332,
+            8561,
+            21944,
+            21662,
+            23891,
+            26458,
+            -16068,
+            243,
+            -18269,
+            7154,
+            -24564,
+            4649,
+            20755,
+            738,
+            -3614,
+            -12345,
+            -29501,
+            -16647,
+            5016,
+            283,
+            28997,
+            9682,
+            -26636,
+            -21537,
+            16867,
+            18988,
+            -1052,
+            -18359,
+            13273,
+            -27571,
+            -28472,
+            1046,
+            23717,
+            -24681,
+            11419,
+            -20635,
+            10461,
+            -5027,
+            -21100,
+            -3437,
+            28981,
+            -26370,
+            -16144,
+            -13120,
+            -3520,
+            20056,
+            -6812,
+            1204,
+            -21420,
+            26618,
+            9299,
+            18968,
+            9848,
+        ],
+        want_im: [
+            -5047,
+            9284,
+            -14910,
+            -21269,
+            -24326,
+            17777,
+            4787,
+            15907,
+            -24113,
+            2065,
+            -2369,
+            10186,
+            -15799,
+            29113,
+            -5491,
+            -4565,
+            14719,
+            -20020,
+            13290,
+            25703,
+            -7796,
+            16968,
+            14392,
+            -24246,
+            -9266,
+            -27204,
+            6565,
+            -2133,
+            -6242,
+            -24704,
+            3990,
+            -17018,
+            323,
+            -6570,
+            -15856,
+            -19462,
+            21894,
+            9021,
+            2977,
+            -18465,
+            -22805,
+            -18782,
+            14817,
+            -2539,
+            -2120,
+            -24363,
+            -9696,
+            -29628,
+            -8393,
+            4301,
+            -16841,
+            21590,
+            11971,
+            -971,
+            5746,
+            24076,
+            -21720,
+            15546,
+            -26342,
+            18401,
+            17078,
+            21047,
+            -20140,
+            -3242,
+        ],
+    )
+}
+
+#[test]
+fn demo_signal_chain() {
+    // 16-sample sine burst, 2 cycles, amplitude 0.9 — the same burst
+    // as demo_gain_stage, now run through the full v0.3.0 library:
+    // Hann window -> 4-tap moving-average FIR -> Butterworth lowpass
+    // biquad -> RMS / energy -> FFT magnitude.
+    let burst: [Q15; 16] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 29490),
+        Q15::from_raw(raw: 20853),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -20853),
+        Q15::from_raw(raw: -29490),
+        Q15::from_raw(raw: -20853),
+    ]
+    // Step 1: Hann window (spot-checks; the full frame is pinned in
+    // demo_gain_stage).
+    let windowed = window(samples: burst, coeffs: HANN16)
+    assert!(windowed[1].raw() == 901)
+    assert!(windowed[7].raw() == -20625)
+    // Step 2: 4-tap moving-average FIR.
+    var ma = Fir::new(
+        taps: [
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+            Q15::from_raw(raw: 8192),
+        ],
+    )
+    let fir_out = run_fir(fir: mut ma, xs: windowed)
+    assert_q15_frame(
+        got: fir_out,
+        want: [
+            0,
+            225,
+            1445,
+            3246,
+            3246,
+            -889,
+            -8777,
+            -15734,
+            -15734,
+            -7109,
+            5088,
+            13124,
+            13124,
+            7546,
+            1698,
+            -1181,
+        ],
+    )
+    // Step 3: Butterworth lowpass biquad (fc = 0.1 fs).
+    var lp = Biquad::lowpass_01()
+    let bq_out = run_biquad(bq: mut lp, xs: fir_out)
+    assert_q15_frame(
+        got: bq_out,
+        want: [
+            0,
+            15,
+            144,
+            588,
+            1367,
+            1916,
+            1133,
+            -1801,
+            -6302,
+            -10123,
+            -10645,
+            -6896,
+            -489,
+            5453,
+            8453,
+            8069,
+        ],
+    )
+    // Step 4: RMS and energy of the filtered output.
+    assert!(rms(x: bq_out).raw() == 5477)
+    assert!(energy(x: bq_out).raw() == 14649)
+    // Step 5: FFT magnitude of the filtered output — the 2-cycle sine
+    // peaks at bins 1 and 2 (the Hann window spreads it), with the
+    // mirror image at bins 14 and 15.
+    let spec = fft16(x: to_cplx(xs: bq_out))
+    assert_cplx_frame(
+        got: spec,
+        want_re: [
+            -9118,
+            41809,
+            -10646,
+            -9028,
+            -4509,
+            -3978,
+            -3714,
+            -3595,
+            -3560,
+            -3595,
+            -3714,
+            -3978,
+            -4509,
+            -9028,
+            -10646,
+            41809,
+        ],
+        want_im: [
+            0,
+            -8059,
+            41337,
+            666,
+            2699,
+            1860,
+            1163,
+            559,
+            0,
+            -559,
+            -1163,
+            -1860,
+            -2699,
+            -666,
+            -41337,
+            8059,
+        ],
+    )
+    assert_q15_frame(
+        got: fft_magnitude(x: spec),
+        want: [
+            9118,
+            42578,
+            42686,
+            9053,
+            5253,
+            4393,
+            3891,
+            3638,
+            3561,
+            3638,
+            3891,
+            4393,
+            5253,
+            9053,
+            42686,
+            42578,
+        ],
+    )
+}
+// --- v0.4.0 differential tests ----------------------------------------
+// Seeded random inputs (seed 20261120, see tools/gen_vectors.py).
+// Expected values transcribed from tools/vectors.json, never from
+// Fe output.
+
+#[test]
+fn dot_random() {
+    // Random 8- and 16-sample frames through the saturating dot.
+    let a0: [Q15; 8] = [
+        Q15::from_raw(raw: -940),
+        Q15::from_raw(raw: 8333),
+        Q15::from_raw(raw: 4022),
+        Q15::from_raw(raw: -4665),
+        Q15::from_raw(raw: -10755),
+        Q15::from_raw(raw: 17108),
+        Q15::from_raw(raw: -16046),
+        Q15::from_raw(raw: 16622),
+    ]
+    let b0: [Q15; 8] = [
+        Q15::from_raw(raw: -20887),
+        Q15::from_raw(raw: -2639),
+        Q15::from_raw(raw: -23045),
+        Q15::from_raw(raw: -2188),
+        Q15::from_raw(raw: -21224),
+        Q15::from_raw(raw: 26374),
+        Q15::from_raw(raw: -21726),
+        Q15::from_raw(raw: -9761),
+    ]
+    assert!(dot(a: a0, b: b0).raw() == 23834)
+    let a1: [Q15; 8] = [
+        Q15::from_raw(raw: -15744),
+        Q15::from_raw(raw: 28624),
+        Q15::from_raw(raw: 606),
+        Q15::from_raw(raw: -5922),
+        Q15::from_raw(raw: 25854),
+        Q15::from_raw(raw: -8331),
+        Q15::from_raw(raw: -19729),
+        Q15::from_raw(raw: 8202),
+    ]
+    let b1: [Q15; 8] = [
+        Q15::from_raw(raw: 13077),
+        Q15::from_raw(raw: 5850),
+        Q15::from_raw(raw: -10413),
+        Q15::from_raw(raw: -24214),
+        Q15::from_raw(raw: -10402),
+        Q15::from_raw(raw: -26493),
+        Q15::from_raw(raw: -22384),
+        Q15::from_raw(raw: 16878),
+    ]
+    assert!(dot(a: a1, b: b1).raw() == 19241)
+    let a2: [Q15; 8] = [
+        Q15::from_raw(raw: -7330),
+        Q15::from_raw(raw: 7786),
+        Q15::from_raw(raw: 29460),
+        Q15::from_raw(raw: 21289),
+        Q15::from_raw(raw: -3695),
+        Q15::from_raw(raw: -5849),
+        Q15::from_raw(raw: -9369),
+        Q15::from_raw(raw: -5188),
+    ]
+    let b2: [Q15; 8] = [
+        Q15::from_raw(raw: 15209),
+        Q15::from_raw(raw: -5946),
+        Q15::from_raw(raw: -5844),
+        Q15::from_raw(raw: -28984),
+        Q15::from_raw(raw: 20857),
+        Q15::from_raw(raw: 5903),
+        Q15::from_raw(raw: 8611),
+        Q15::from_raw(raw: -14215),
+    ]
+    assert!(dot(a: a2, b: b2).raw() == -32517)
+    let a3: [Q15; 8] = [
+        Q15::from_raw(raw: -6858),
+        Q15::from_raw(raw: -14903),
+        Q15::from_raw(raw: -1623),
+        Q15::from_raw(raw: 2448),
+        Q15::from_raw(raw: -26435),
+        Q15::from_raw(raw: 17778),
+        Q15::from_raw(raw: -2375),
+        Q15::from_raw(raw: -5931),
+    ]
+    let b3: [Q15; 8] = [
+        Q15::from_raw(raw: -27113),
+        Q15::from_raw(raw: 10164),
+        Q15::from_raw(raw: 26871),
+        Q15::from_raw(raw: 4075),
+        Q15::from_raw(raw: 4346),
+        Q15::from_raw(raw: -9312),
+        Q15::from_raw(raw: 24328),
+        Q15::from_raw(raw: 1429),
+    ]
+    assert!(dot(a: a3, b: b3).raw() == -10555)
+    let a4: [Q15; 16] = [
+        Q15::from_raw(raw: 82),
+        Q15::from_raw(raw: 1373),
+        Q15::from_raw(raw: -4906),
+        Q15::from_raw(raw: -12126),
+        Q15::from_raw(raw: -3620),
+        Q15::from_raw(raw: 11862),
+        Q15::from_raw(raw: -5718),
+        Q15::from_raw(raw: -29774),
+        Q15::from_raw(raw: 18353),
+        Q15::from_raw(raw: 7739),
+        Q15::from_raw(raw: 17854),
+        Q15::from_raw(raw: 98),
+        Q15::from_raw(raw: -27441),
+        Q15::from_raw(raw: 3844),
+        Q15::from_raw(raw: -9857),
+        Q15::from_raw(raw: 13468),
+    ]
+    let b4: [Q15; 16] = [
+        Q15::from_raw(raw: -23052),
+        Q15::from_raw(raw: -16664),
+        Q15::from_raw(raw: 7959),
+        Q15::from_raw(raw: -18829),
+        Q15::from_raw(raw: 19268),
+        Q15::from_raw(raw: 23931),
+        Q15::from_raw(raw: -25885),
+        Q15::from_raw(raw: -19888),
+        Q15::from_raw(raw: 27039),
+        Q15::from_raw(raw: 21698),
+        Q15::from_raw(raw: -8437),
+        Q15::from_raw(raw: -11467),
+        Q15::from_raw(raw: 17193),
+        Q15::from_raw(raw: -7930),
+        Q15::from_raw(raw: -1964),
+        Q15::from_raw(raw: -21487),
+    ]
+    assert!(dot(a: a4, b: b4).raw() == 26211)
+    let a5: [Q15; 16] = [
+        Q15::from_raw(raw: -28453),
+        Q15::from_raw(raw: -26964),
+        Q15::from_raw(raw: 21197),
+        Q15::from_raw(raw: 2761),
+        Q15::from_raw(raw: -13053),
+        Q15::from_raw(raw: -28828),
+        Q15::from_raw(raw: -11903),
+        Q15::from_raw(raw: 15545),
+        Q15::from_raw(raw: -25140),
+        Q15::from_raw(raw: -18531),
+        Q15::from_raw(raw: 17416),
+        Q15::from_raw(raw: -29109),
+        Q15::from_raw(raw: -24876),
+        Q15::from_raw(raw: -26154),
+        Q15::from_raw(raw: 29664),
+        Q15::from_raw(raw: -11981),
+    ]
+    let b5: [Q15; 16] = [
+        Q15::from_raw(raw: -5366),
+        Q15::from_raw(raw: -14162),
+        Q15::from_raw(raw: 18544),
+        Q15::from_raw(raw: 24446),
+        Q15::from_raw(raw: 10813),
+        Q15::from_raw(raw: -9590),
+        Q15::from_raw(raw: -26521),
+        Q15::from_raw(raw: -6647),
+        Q15::from_raw(raw: 6144),
+        Q15::from_raw(raw: -26577),
+        Q15::from_raw(raw: -21126),
+        Q15::from_raw(raw: 29540),
+        Q15::from_raw(raw: -22090),
+        Q15::from_raw(raw: -27918),
+        Q15::from_raw(raw: -6183),
+        Q15::from_raw(raw: -29454),
+    ]
+    assert!(dot(a: a5, b: b5).raw() == 58050)
+}
+
+#[test]
+fn fir_random() {
+    // Random 8 taps over a random 16-sample input.
+    var fir = Fir::new(
+        taps: [
+            Q15::from_raw(raw: -15725),
+            Q15::from_raw(raw: -19116),
+            Q15::from_raw(raw: 5617),
+            Q15::from_raw(raw: -29162),
+            Q15::from_raw(raw: 1424),
+            Q15::from_raw(raw: 5426),
+            Q15::from_raw(raw: 19561),
+            Q15::from_raw(raw: 27226),
+        ],
+    )
+    let input: [Q15; 16] = [
+        Q15::from_raw(raw: -4787),
+        Q15::from_raw(raw: 13243),
+        Q15::from_raw(raw: -10376),
+        Q15::from_raw(raw: 4998),
+        Q15::from_raw(raw: 25803),
+        Q15::from_raw(raw: 3012),
+        Q15::from_raw(raw: -3227),
+        Q15::from_raw(raw: 6632),
+        Q15::from_raw(raw: 17422),
+        Q15::from_raw(raw: -8654),
+        Q15::from_raw(raw: -8912),
+        Q15::from_raw(raw: 8273),
+        Q15::from_raw(raw: 344),
+        Q15::from_raw(raw: -27543),
+        Q15::from_raw(raw: -23169),
+        Q15::from_raw(raw: 26805),
+    ]
+    let out = run_fir(fir: mut fir, xs: input)
+    assert_q15_frame(
+        got: out,
+        want: [
+            2297,
+            -3563,
+            -3567,
+            10185,
+            -29071,
+            -6624,
+            -1349,
+            -21320,
+            -8705,
+            -3236,
+            26324,
+            7232,
+            3614,
+            26153,
+            33973,
+            3818,
+        ],
+    )
+}
+
+#[test]
+fn biquad_random() {
+    // Random 16-sample input through the documented lowpass.
+    let input: [Q15; 16] = [
+        Q15::from_raw(raw: 5329),
+        Q15::from_raw(raw: -23421),
+        Q15::from_raw(raw: -25897),
+        Q15::from_raw(raw: -5904),
+        Q15::from_raw(raw: -4120),
+        Q15::from_raw(raw: -742),
+        Q15::from_raw(raw: 28579),
+        Q15::from_raw(raw: -14095),
+        Q15::from_raw(raw: 13298),
+        Q15::from_raw(raw: -8266),
+        Q15::from_raw(raw: -19450),
+        Q15::from_raw(raw: 20917),
+        Q15::from_raw(raw: -26324),
+        Q15::from_raw(raw: 25127),
+        Q15::from_raw(raw: 10554),
+        Q15::from_raw(raw: 27691),
+    ]
+    var lp = Biquad::lowpass_01()
+    let out = run_biquad(bq: mut lp, xs: input)
+    assert_q15_frame(
+        got: out,
+        want: [
+            359,
+            -451,
+            -5211,
+            -11242,
+            -13520,
+            -11816,
+            -6375,
+            447,
+            4065,
+            4747,
+            2218,
+            -1195,
+            -2547,
+            -2864,
+            105,
+            6289,
+        ],
+    )
+}
+
+#[test]
+fn fft_random() {
+    // Seeded random complex frames; the oracle cross-checked
+    // each against an independent float DFT (<= 16 ulp).
+    let x16 = to_cplx2(
+        re: [
+            Q15::from_raw(raw: 20304),
+            Q15::from_raw(raw: -8328),
+            Q15::from_raw(raw: 12076),
+            Q15::from_raw(raw: -11242),
+            Q15::from_raw(raw: 28604),
+            Q15::from_raw(raw: 12436),
+            Q15::from_raw(raw: -7100),
+            Q15::from_raw(raw: 348),
+            Q15::from_raw(raw: 5744),
+            Q15::from_raw(raw: -1405),
+            Q15::from_raw(raw: -10342),
+            Q15::from_raw(raw: 21297),
+            Q15::from_raw(raw: 28469),
+            Q15::from_raw(raw: -2961),
+            Q15::from_raw(raw: -14412),
+            Q15::from_raw(raw: 15935),
+        ],
+        im: [
+            Q15::from_raw(raw: 19014),
+            Q15::from_raw(raw: 2301),
+            Q15::from_raw(raw: -2463),
+            Q15::from_raw(raw: 28853),
+            Q15::from_raw(raw: 22123),
+            Q15::from_raw(raw: 6587),
+            Q15::from_raw(raw: -11667),
+            Q15::from_raw(raw: -26418),
+            Q15::from_raw(raw: 11823),
+            Q15::from_raw(raw: -1795),
+            Q15::from_raw(raw: 21912),
+            Q15::from_raw(raw: 14121),
+            Q15::from_raw(raw: 24314),
+            Q15::from_raw(raw: -18324),
+            Q15::from_raw(raw: -9538),
+            Q15::from_raw(raw: -27744),
+        ],
+    )
+    let spec16 = fft16(x: x16)
+    assert_cplx_frame(
+        got: spec16,
+        want_re: [
+            89423,
+            32669,
+            77792,
+            24771,
+            102856,
+            -37334,
+            14840,
+            95213,
+            37263,
+            -24051,
+            -58534,
+            -50113,
+            102942,
+            78192,
+            -158198,
+            -2867,
+        ],
+        want_im: [
+            53099,
+            -6582,
+            -80887,
+            26736,
+            105626,
+            47580,
+            85659,
+            38406,
+            97937,
+            -52810,
+            3195,
+            -22668,
+            52434,
+            40036,
+            -70367,
+            -13170,
+        ],
+    )
+    let mag16 = fft_magnitude(x: spec16)
+    assert_q15_frame(
+        got: mag16,
+        want: [
+            104000,
+            33325,
+            112224,
+            36447,
+            147432,
+            60479,
+            86935,
+            102667,
+            104786,
+            58029,
+            58621,
+            55001,
+            115527,
+            87846,
+            173142,
+            13478,
+        ],
+    )
+    assert_parseval_cplx(x: x16, spec: spec16)
+    let rt16 = ifft16(x: spec16)
+    assert_cplx_frame(
+        got: rt16,
+        want_re: [
+            20304,
+            -8328,
+            12075,
+            -11242,
+            28604,
+            12436,
+            -7100,
+            348,
+            5744,
+            -1405,
+            -10341,
+            21297,
+            28469,
+            -2961,
+            -14412,
+            15935,
+        ],
+        want_im: [
+            19014,
+            2301,
+            -2463,
+            28852,
+            22123,
+            6587,
+            -11667,
+            -26417,
+            11823,
+            -1795,
+            21912,
+            14120,
+            24314,
+            -18324,
+            -9538,
+            -27743,
+        ],
+    )
+    let x32 = to_cplx2(
+        re: [
+            Q15::from_raw(raw: 22979),
+            Q15::from_raw(raw: -7288),
+            Q15::from_raw(raw: -18971),
+            Q15::from_raw(raw: 24257),
+            Q15::from_raw(raw: -27329),
+            Q15::from_raw(raw: -2268),
+            Q15::from_raw(raw: -13922),
+            Q15::from_raw(raw: -12155),
+            Q15::from_raw(raw: 10018),
+            Q15::from_raw(raw: -28335),
+            Q15::from_raw(raw: 24891),
+            Q15::from_raw(raw: 17338),
+            Q15::from_raw(raw: 13347),
+            Q15::from_raw(raw: -14797),
+            Q15::from_raw(raw: 15025),
+            Q15::from_raw(raw: -21986),
+            Q15::from_raw(raw: 5892),
+            Q15::from_raw(raw: -9143),
+            Q15::from_raw(raw: 18976),
+            Q15::from_raw(raw: 2087),
+            Q15::from_raw(raw: -11394),
+            Q15::from_raw(raw: 9007),
+            Q15::from_raw(raw: 13982),
+            Q15::from_raw(raw: -27987),
+            Q15::from_raw(raw: -12116),
+            Q15::from_raw(raw: -10020),
+            Q15::from_raw(raw: 2320),
+            Q15::from_raw(raw: -3325),
+            Q15::from_raw(raw: 8329),
+            Q15::from_raw(raw: -8927),
+            Q15::from_raw(raw: 12869),
+            Q15::from_raw(raw: 13220),
+        ],
+        im: [
+            Q15::from_raw(raw: 6597),
+            Q15::from_raw(raw: 11311),
+            Q15::from_raw(raw: 12723),
+            Q15::from_raw(raw: -28816),
+            Q15::from_raw(raw: 2857),
+            Q15::from_raw(raw: -15838),
+            Q15::from_raw(raw: 2893),
+            Q15::from_raw(raw: -17983),
+            Q15::from_raw(raw: -2732),
+            Q15::from_raw(raw: 16202),
+            Q15::from_raw(raw: 2429),
+            Q15::from_raw(raw: -17800),
+            Q15::from_raw(raw: 22580),
+            Q15::from_raw(raw: -2960),
+            Q15::from_raw(raw: -4049),
+            Q15::from_raw(raw: -24508),
+            Q15::from_raw(raw: 19389),
+            Q15::from_raw(raw: 12523),
+            Q15::from_raw(raw: 28358),
+            Q15::from_raw(raw: -21964),
+            Q15::from_raw(raw: 14858),
+            Q15::from_raw(raw: -23473),
+            Q15::from_raw(raw: -18066),
+            Q15::from_raw(raw: -18432),
+            Q15::from_raw(raw: 25762),
+            Q15::from_raw(raw: 11348),
+            Q15::from_raw(raw: -21428),
+            Q15::from_raw(raw: -14700),
+            Q15::from_raw(raw: 7764),
+            Q15::from_raw(raw: 12434),
+            Q15::from_raw(raw: -5137),
+            Q15::from_raw(raw: 24986),
+        ],
+    )
+    let spec32 = fft32(x: x32)
+    assert_cplx_frame(
+        got: spec32,
+        want_re: [
+            -15426,
+            -9460,
+            21835,
+            47265,
+            24368,
+            -93208,
+            106699,
+            22834,
+            95320,
+            34940,
+            -69354,
+            -1562,
+            111181,
+            -27918,
+            -114011,
+            -125287,
+            145218,
+            -80062,
+            92229,
+            78901,
+            156154,
+            -27706,
+            56107,
+            219124,
+            -186208,
+            -42346,
+            28650,
+            124944,
+            -116423,
+            154504,
+            125597,
+            -1571,
+        ],
+        want_im: [
+            -2872,
+            7533,
+            155395,
+            92372,
+            56212,
+            63081,
+            -55619,
+            76323,
+            162572,
+            -25591,
+            18317,
+            26977,
+            -127077,
+            -90182,
+            -127891,
+            -120007,
+            192468,
+            -95745,
+            142583,
+            34286,
+            -52822,
+            -40951,
+            -74861,
+            -40635,
+            36132,
+            -70873,
+            -62875,
+            -9539,
+            127515,
+            -26680,
+            28599,
+            14959,
+        ],
+    )
+    let mag32 = fft_magnitude(x: spec32)
+    assert_q15_frame(
+        got: mag32,
+        want: [
+            15691,
+            12093,
+            156922,
+            103762,
+            61266,
+            112548,
+            120325,
+            79666,
+            188456,
+            43309,
+            71732,
+            27022,
+            168848,
+            94404,
+            171332,
+            173489,
+            241106,
+            124808,
+            169812,
+            86028,
+            164846,
+            49443,
+            93553,
+            222860,
+            189681,
+            82560,
+            69095,
+            125308,
+            172668,
+            156791,
+            128812,
+            15041,
+        ],
+    )
+    assert_parseval_cplx(x: x32, spec: spec32)
+    let rt32 = ifft32(x: spec32)
+    assert_cplx_frame(
+        got: rt32,
+        want_re: [
+            22979,
+            -7288,
+            -18971,
+            24256,
+            -27329,
+            -2268,
+            -13921,
+            -12154,
+            10018,
+            -28335,
+            24891,
+            17338,
+            13347,
+            -14797,
+            15024,
+            -21985,
+            5892,
+            -9143,
+            18976,
+            2087,
+            -11394,
+            9006,
+            13982,
+            -27987,
+            -12116,
+            -10020,
+            2320,
+            -3325,
+            8329,
+            -8927,
+            12869,
+            13220,
+        ],
+        want_im: [
+            6597,
+            11310,
+            12722,
+            -28816,
+            2857,
+            -15838,
+            2893,
+            -17983,
+            -2732,
+            16201,
+            2430,
+            -17800,
+            22580,
+            -2959,
+            -4049,
+            -24508,
+            19389,
+            12523,
+            28358,
+            -21964,
+            14858,
+            -23473,
+            -18066,
+            -18432,
+            25762,
+            11348,
+            -21427,
+            -14700,
+            7764,
+            12434,
+            -5137,
+            24985,
+        ],
+    )
+}
+
+#[test]
+fn scalar_random() {
+    // Seeded random raws (seed 20261120): sqrt, reciprocal,
+    // and convert_q over 6 format pairs.
+    assert!(Q15::from_raw(raw: -11622).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -11622).reciprocal().raw() == -92388)
+    assert!(Q15::from_raw(raw: 5698).sqrt().raw() == 13664)
+    assert!(Q15::from_raw(raw: 5698).reciprocal().raw() == 188444)
+    assert!(Q15::from_raw(raw: 4776).sqrt().raw() == 12510)
+    assert!(Q15::from_raw(raw: 4776).reciprocal().raw() == 224820)
+    assert!(Q15::from_raw(raw: 10410).sqrt().raw() == 18469)
+    assert!(Q15::from_raw(raw: 10410).reciprocal().raw() == 103144)
+    assert!(Q15::from_raw(raw: 11704).sqrt().raw() == 19584)
+    assert!(Q15::from_raw(raw: 11704).reciprocal().raw() == 91742)
+    assert!(Q15::from_raw(raw: -19774).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -19774).reciprocal().raw() == -54301)
+    assert!(Q15::from_raw(raw: 3503).sqrt().raw() == 10714)
+    assert!(Q15::from_raw(raw: 3503).reciprocal().raw() == 306520)
+    assert!(Q15::from_raw(raw: -20395).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -20395).reciprocal().raw() == -52647)
+    assert!(Q15::from_raw(raw: -18696).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -18696).reciprocal().raw() == -57432)
+    assert!(Q15::from_raw(raw: -25743).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -25743).reciprocal().raw() == -41710)
+    assert!(Q15::from_raw(raw: -63).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -63).reciprocal().raw() == -17043456)
+    assert!(Q15::from_raw(raw: -45).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -45).reciprocal().raw() == -23860736)
+    assert!(Q15::from_raw(raw: 98).sqrt().raw() == 1792)
+    assert!(Q15::from_raw(raw: 98).reciprocal().raw() == 10956544)
+    assert!(Q15::from_raw(raw: -597495732).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -597495732).reciprocal().raw() == -2)
+    assert!(Q15::from_raw(raw: -8539352).sqrt().raw() == 0)
+    assert!(Q15::from_raw(raw: -8539352).reciprocal().raw() == -126)
+    assert!(Q15::from_raw(raw: 1).sqrt().raw() == 181)
+    assert!(Q15::from_raw(raw: 1).reciprocal().raw() == 1073725440)
+    let c0: Q7 = convert_q(x: Q15::from_raw(raw: -11622))
+    assert!(c0.raw() == -45)
+    let c1: Q31 = convert_q(x: Q15::from_raw(raw: -11622))
+    assert!(c1.raw() == -761659392)
+    let c2: Q15 = convert_q(x: Q7::from_raw(raw: -11622))
+    assert!(c2.raw() == -2975232)
+    let c3: Q15 = convert_q(x: Q31::from_raw(raw: -11622))
+    assert!(c3.raw() == 0)
+    let c4: Q<0> = convert_q(x: Q15::from_raw(raw: -11622))
+    assert!(c4.raw() == 0)
+    let c5: Q15 = convert_q(x: Q<0>::from_raw(raw: -11622))
+    assert!(c5.raw() == -380829696)
+    let c6: Q7 = convert_q(x: Q15::from_raw(raw: 5698))
+    assert!(c6.raw() == 22)
+    let c7: Q31 = convert_q(x: Q15::from_raw(raw: 5698))
+    assert!(c7.raw() == 373424128)
+    let c8: Q15 = convert_q(x: Q7::from_raw(raw: 5698))
+    assert!(c8.raw() == 1458688)
+    let c9: Q15 = convert_q(x: Q31::from_raw(raw: 5698))
+    assert!(c9.raw() == 0)
+    let c10: Q<0> = convert_q(x: Q15::from_raw(raw: 5698))
+    assert!(c10.raw() == 0)
+    let c11: Q15 = convert_q(x: Q<0>::from_raw(raw: 5698))
+    assert!(c11.raw() == 186712064)
+    let c12: Q7 = convert_q(x: Q15::from_raw(raw: 4776))
+    assert!(c12.raw() == 19)
+    let c13: Q31 = convert_q(x: Q15::from_raw(raw: 4776))
+    assert!(c13.raw() == 312999936)
+    let c14: Q15 = convert_q(x: Q7::from_raw(raw: 4776))
+    assert!(c14.raw() == 1222656)
+    let c15: Q15 = convert_q(x: Q31::from_raw(raw: 4776))
+    assert!(c15.raw() == 0)
+    let c16: Q<0> = convert_q(x: Q15::from_raw(raw: 4776))
+    assert!(c16.raw() == 0)
+    let c17: Q15 = convert_q(x: Q<0>::from_raw(raw: 4776))
+    assert!(c17.raw() == 156499968)
+    let c18: Q7 = convert_q(x: Q15::from_raw(raw: 10410))
+    assert!(c18.raw() == 41)
+    let c19: Q31 = convert_q(x: Q15::from_raw(raw: 10410))
+    assert!(c19.raw() == 682229760)
+    let c20: Q15 = convert_q(x: Q7::from_raw(raw: 10410))
+    assert!(c20.raw() == 2664960)
+    let c21: Q15 = convert_q(x: Q31::from_raw(raw: 10410))
+    assert!(c21.raw() == 0)
+    let c22: Q<0> = convert_q(x: Q15::from_raw(raw: 10410))
+    assert!(c22.raw() == 0)
+    let c23: Q15 = convert_q(x: Q<0>::from_raw(raw: 10410))
+    assert!(c23.raw() == 341114880)
+    let c24: Q7 = convert_q(x: Q15::from_raw(raw: 11704))
+    assert!(c24.raw() == 46)
+    let c25: Q31 = convert_q(x: Q15::from_raw(raw: 11704))
+    assert!(c25.raw() == 767033344)
+    let c26: Q15 = convert_q(x: Q7::from_raw(raw: 11704))
+    assert!(c26.raw() == 2996224)
+    let c27: Q15 = convert_q(x: Q31::from_raw(raw: 11704))
+    assert!(c27.raw() == 0)
+    let c28: Q<0> = convert_q(x: Q15::from_raw(raw: 11704))
+    assert!(c28.raw() == 0)
+    let c29: Q15 = convert_q(x: Q<0>::from_raw(raw: 11704))
+    assert!(c29.raw() == 383516672)
+    let c30: Q7 = convert_q(x: Q15::from_raw(raw: -19774))
+    assert!(c30.raw() == -77)
+    let c31: Q31 = convert_q(x: Q15::from_raw(raw: -19774))
+    assert!(c31.raw() == -1295908864)
+    let c32: Q15 = convert_q(x: Q7::from_raw(raw: -19774))
+    assert!(c32.raw() == -5062144)
+    let c33: Q15 = convert_q(x: Q31::from_raw(raw: -19774))
+    assert!(c33.raw() == 0)
+    let c34: Q<0> = convert_q(x: Q15::from_raw(raw: -19774))
+    assert!(c34.raw() == -1)
+    let c35: Q15 = convert_q(x: Q<0>::from_raw(raw: -19774))
+    assert!(c35.raw() == -647954432)
+    let c36: Q7 = convert_q(x: Q15::from_raw(raw: 3503))
+    assert!(c36.raw() == 14)
+    let c37: Q31 = convert_q(x: Q15::from_raw(raw: 3503))
+    assert!(c37.raw() == 229572608)
+    let c38: Q15 = convert_q(x: Q7::from_raw(raw: 3503))
+    assert!(c38.raw() == 896768)
+    let c39: Q15 = convert_q(x: Q31::from_raw(raw: 3503))
+    assert!(c39.raw() == 0)
+    let c40: Q<0> = convert_q(x: Q15::from_raw(raw: 3503))
+    assert!(c40.raw() == 0)
+    let c41: Q15 = convert_q(x: Q<0>::from_raw(raw: 3503))
+    assert!(c41.raw() == 114786304)
+    let c42: Q7 = convert_q(x: Q15::from_raw(raw: -20395))
+    assert!(c42.raw() == -80)
+    let c43: Q31 = convert_q(x: Q15::from_raw(raw: -20395))
+    assert!(c43.raw() == -1336606720)
+    let c44: Q15 = convert_q(x: Q7::from_raw(raw: -20395))
+    assert!(c44.raw() == -5221120)
+    let c45: Q15 = convert_q(x: Q31::from_raw(raw: -20395))
+    assert!(c45.raw() == 0)
+    let c46: Q<0> = convert_q(x: Q15::from_raw(raw: -20395))
+    assert!(c46.raw() == -1)
+    let c47: Q15 = convert_q(x: Q<0>::from_raw(raw: -20395))
+    assert!(c47.raw() == -668303360)
+    let c48: Q7 = convert_q(x: Q15::from_raw(raw: -18696))
+    assert!(c48.raw() == -73)
+    let c49: Q31 = convert_q(x: Q15::from_raw(raw: -18696))
+    assert!(c49.raw() == -1225261056)
+    let c50: Q15 = convert_q(x: Q7::from_raw(raw: -18696))
+    assert!(c50.raw() == -4786176)
+    let c51: Q15 = convert_q(x: Q31::from_raw(raw: -18696))
+    assert!(c51.raw() == 0)
+    let c52: Q<0> = convert_q(x: Q15::from_raw(raw: -18696))
+    assert!(c52.raw() == -1)
+    let c53: Q15 = convert_q(x: Q<0>::from_raw(raw: -18696))
+    assert!(c53.raw() == -612630528)
+    let c54: Q7 = convert_q(x: Q15::from_raw(raw: -25743))
+    assert!(c54.raw() == -101)
+    let c55: Q31 = convert_q(x: Q15::from_raw(raw: -25743))
+    assert!(c55.raw() == -1687093248)
+    let c56: Q15 = convert_q(x: Q7::from_raw(raw: -25743))
+    assert!(c56.raw() == -6590208)
+    let c57: Q15 = convert_q(x: Q31::from_raw(raw: -25743))
+    assert!(c57.raw() == 0)
+    let c58: Q<0> = convert_q(x: Q15::from_raw(raw: -25743))
+    assert!(c58.raw() == -1)
+    let c59: Q15 = convert_q(x: Q<0>::from_raw(raw: -25743))
+    assert!(c59.raw() == -843546624)
+}
