@@ -3,7 +3,7 @@
 **One-sentence pitch:** Saturating binary Q-format fixed-point arithmetic for
 audio-rate DSP in pure Fe — Q7/Q15/Q31, biquad and FIR filters, format
 conversion, Hann/Hamming/Blackman windows, frame statistics, Newton
-sqrt/reciprocal, and a radix-2 FFT / inverse FFT at 16/32/64 points, with
+sqrt, exactly-rounded reciprocal, and a radix-2 FFT / inverse FFT at 16/32/64 points, with
 every result verified against an independent Python oracle.
 
 **Fe-specific highlight:** the library is built on Fe 26.5 features that do
@@ -51,10 +51,10 @@ meant hand-rolling the widening, rounding, and clamping in every contract.
 ## Architecture
 
 ```
-fedsp/                          (Fe workspace, 0.4.0)
+fedsp/                          (Fe workspace, 0.4.1)
   fe.toml                  workspace: members = ["ingots/*"]
   ingots/fedsp/
-    fe.toml                ingot: fedsp 0.4.0 (Fe 26.5.0+)
+    fe.toml                ingot: fedsp 0.4.1 (Fe 26.5.0+)
     src/lib.fe             the whole library (single file, ~1540 lines)
       Q<const FRAC: i32>   conversions, saturating arithmetic, scaling,
                            shifts, clamp/min/max, abs/neg, sqrt/reciprocal
@@ -76,11 +76,11 @@ fedsp/                          (Fe workspace, 0.4.0)
       fft16 / 32 / 64      radix-2 DIT FFT (unscaled forward transform)
       ifft16 / 32 / 64     inverse FFT (conjugate trick, scaled by 1/N)
       fft_magnitude        |X[k]| per bin, Q15
-    src/tests.fe           31 tests, 378 assertions, all oracle-verified
+    src/tests.fe           32 tests, 397 assertions, all oracle-verified
                            (26 fixed-vector tests + 5 seeded differential
                            tests, seed 20261120)
   ingots/demo/
-    fe.toml                ingot: demo 0.4.0, depends on fedsp by path
+    fe.toml                ingot: demo 0.4.1, depends on fedsp by path
     src/lib.fe             DspDemo contract + contract test (1 test,
                            sonatina only — see Limitations)
       ChainResult          #[abi] struct: rms, energy, fft_peak,
@@ -140,7 +140,7 @@ just locations.
 
 | Criterion | Weight | Where the evidence lives |
 | --- | --- | --- |
-| Technical quality and correctness | 30% | `ingots/fedsp/src/tests.fe` — 31 tests, 378 assertions, both backends; `tools/gen_vectors.py` — the independent oracle (fixed vectors + seeded differential vectors, seed 20261120); the `dot` overflow bug, found by probe and fixed with a regression test (`dot_saturation`), in `VERIFICATION.md` §v0.2.0; benchmarks in `VERIFICATION.md` §Benchmarks |
+| Technical quality and correctness | 30% | `ingots/fedsp/src/tests.fe` — 32 tests, 397 assertions, both backends; `tools/gen_vectors.py` — the independent oracle (fixed vectors + seeded differential vectors, seed 20261120); the `dot` overflow bug, found by probe and fixed with a regression test (`dot_saturation`), in `VERIFICATION.md` §v0.2.0; the v0.4.1 audit fixes (`from_ratio` negative denominators, exact reciprocal, empty-frame guards) in `VERIFICATION.md` §v0.4.1; benchmarks in `VERIFICATION.md` §Benchmarks |
 | Fe-specific value | 25% | `ingots/fedsp/src/lib.fe` — const-generic `Q<const FRAC: i32>` with compile-time bounds, manual `Copy` impl, `downcast_saturate()`, generic `fft_core<const N: usize>`, mutable-borrow stateful filters; `ingots/demo/src/lib.fe` — the `DspDemo` contract (`msg` + `recv` + `#[abi]` struct return) using the library as a dependency; the "Key design facts" list above (all compiler-probed Fe 26.5 behaviors) |
 | Originality | 20% | `## Problem` above — the stdlib is decimal fixed-point for money; no binary Q-format DSP library existed for Fe. The combination (saturating Q arithmetic + windows + filters + FFT + oracle verification) is the original contribution |
 | Usefulness or insight | 15% | `## Beyond audio: fixed-point math for DeFi` — sqrt/reciprocal as AMM primitives, Q-format vs decimal Wad/Ray; `ingots/demo/` — the library reused as a contract dependency by path (`fedsp = "../fedsp"`), the same way any future project would consume it |
@@ -154,7 +154,8 @@ on-chain math builds on — and that is deliberate, not an accident:
 - **`sqrt` and `reciprocal` are AMM primitives.** Concentrated-liquidity
   math is built on sqrt-prices, and reciprocal is the other half of any
   price inversion. FeDSP's Newton `sqrt` (rounded to nearest, exact on the
-  tested cases) and 5-step Newton `reciprocal` (~1–2 ulp) give contracts
+  tested cases) and exactly-rounded `reciprocal` (one `i64` division,
+  0 ulp — v0.4.1) give contracts
   those operations in binary Q-format, next to the stdlib's decimal
   `Wad` / `Ray`.
 - **Q-format complements decimal fixed-point.** The stdlib's `Fixed<D>` is
@@ -175,6 +176,38 @@ primitive, not a DeFi product**: it ships no AMM, no vault, no oracle,
 and no audit. The DeFi relevance is that the primitives are correct,
 oracle-verified, and reusable — the product built on them is someone
 else's (or a later version's) work.
+
+## What's new in v0.4.1
+
+Pre-submission audit (2026-11-21) of the submitted v0.4.0 code, run
+independently against the submitted GitHub head `0943c14` (verified
+byte-identical to the local working copy). Three errors found and fixed,
+each with a regression test; one verified improvement applied. Full
+record in `VERIFICATION.md` §v0.4.1 and the audit report.
+
+- **`from_ratio` rounded toward zero for negative denominators.**
+  The rounding adjustment keyed on whether numerator and denominator
+  agreed in sign; for every negative denominator it rounded toward
+  zero instead of to nearest (ties away from zero) — up to 1 ulp
+  wrong, e.g. `from_ratio(11, -4)` returned `-2` instead of `-3`.
+  The oracle mirrored the same formula, so the suite could not catch
+  it; all existing vectors used non-negative denominators. Fixed in
+  both the library and the oracle (adjustment now follows the sign of
+  the numerator), verified exact on 20,000 swept cases, and pinned
+  with 5 new negative-denominator asserts.
+- **Reciprocal is now exactly rounded.** The 5-step Newton iteration
+  was ~1 ulp of the normalized reciprocal, but rescaling by `2^k`
+  amplified that to 16384 ulp for Q15 `raw == 1` — while the docs
+  claimed ~1–2 ulp. Replaced with a single `i64` division
+  (`2^(2*FRAC) / raw`), exactly rounded (0 ulp) on all 13,568 swept
+  `(FRAC, raw)` pairs, including cross-format cases now pinned in
+  the tests (Q7, Q<5>, Q<10>, Q<30>).
+- **Empty frames and filters no longer trap.** `mean`, `rms`, and
+  `Fir::step` trapped (division by zero / empty delay-line index)
+  on zero-length inputs, breaking the library's "never reverts" rule.
+  They now return zero by convention, like `dot` and `energy`
+  already did. New `empty_frames` test.
+- Test suite grows to 32 tests, 397 assertions (was 31 / 378).
 
 ## What's new in v0.4.0
 
@@ -393,12 +426,17 @@ python3 tools/gen_vectors.py   # rewrites tools/vectors.json, tools/hann_tables.
   windowing, dot products, biquad/FIR filters, format conversion, frame
   statistics, sqrt, reciprocal, and the FFT — resampling is the remaining
   natural follow-up, not included here.
-- **Reciprocal is ~1-2 ulp, not exact.** Newton's iteration converges to
-  within ~1-2 ulp of the true reciprocal (the rounded iteration stalls 1
-  ulp below values like 2.0 and 4.0); the exact result is pinned by the
-  oracle, but callers needing a correctly-rounded reciprocal should not
-  assume it. For small inputs the absolute error grows with the final
-  left shift, while the relative error stays ~1 ulp.
+- **Reciprocal is exactly rounded (v0.4.1).** The old 5-step Newton
+  iteration converged to ~1 ulp of the *normalized* reciprocal, but the
+  final rescale by `2^k` amplified that to as much as `2^k` ulp
+  (16384 ulp for Q15 `raw == 1`). v0.4.1 replaces it with a single
+  `i64` division — `1 / x` in Q<FRAC> has raw `2^(2*FRAC) / raw`,
+  and `2^(2*FRAC) <= 2^62` fits in `i64` — which is exactly rounded
+  (0 ulp) on every input, verified against exact rational arithmetic
+  on 13,568 swept `(FRAC, raw)` pairs. The old "Reciprocal is ~1-2
+  ulp, not exact" limitation is gone; the remaining limitation is
+  only that `Q<31>` reciprocals saturate (every `|1/x| > 1` there)
+  and `Q<0>` gives the truncated integer reciprocal.
 - **`Q<31>` reciprocal always saturates.** Every `|1/x| > 1` for
   `|x| < 1` in Q31, so `reciprocal` returns `maximum()` / `minimum()` by
   sign (except `reciprocal(0) == maximum()`).
