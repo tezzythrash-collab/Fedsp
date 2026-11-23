@@ -213,6 +213,13 @@ fn conversions_from_ratio() {
     assert!(Q15::from_ratio(num: 1, den: 0).raw() == 2147483647)
     assert!(Q15::from_ratio(num: -1, den: 0).raw() == -2147483648)
     assert!(Q15::from_ratio(num: 0, den: 0).raw() == 0)
+    // Negative denominators (v0.4.1 audit): the old formula rounded
+    // toward zero here instead of to nearest, ties away from zero.
+    assert!(Q15::from_ratio(num: 11, den: -4).raw() == -90112)
+    assert!(Q15::from_ratio(num: -11, den: -4).raw() == 90112)
+    assert!(Q15::from_ratio(num: 10, den: -4).raw() == -81920)
+    assert!(Q15::from_ratio(num: -20, den: -7).raw() == 93623)
+    assert!(Q15::from_ratio(num: 1, den: -3).raw() == -10923)
 }
 
 #[test]
@@ -631,6 +638,21 @@ fn frame_stats() {
 }
 
 #[test]
+fn empty_frames() {
+    // Zero-length frames and filters (v0.4.1 audit): mean, rms, and
+    // Fir::step used to trap (division by zero / empty delay-line
+    // index). By convention they now return zero — the same value
+    // dot and energy already returned for empty inputs.
+    let e: [Q15; 0] = []
+    assert!(mean(x: e).raw() == 0)
+    assert!(rms(x: e).raw() == 0)
+    assert!(energy(x: e).raw() == 0)
+    assert!(dot(a: e, b: e).raw() == 0)
+    var f = Fir::new(taps: [])
+    assert!(f.step(x: Q15::one()).raw() == 0)
+}
+
+#[test]
 fn sqrt_reciprocal() {
     // Square roots: exact cases, rounding, edges.
     assert!(Q15::one().sqrt().raw() == 32768)
@@ -650,23 +672,36 @@ fn sqrt_reciprocal() {
     assert!(Q<0>::from_raw(raw: 2).sqrt().raw() == 1)
     assert!(Q<0>::zero().sqrt().raw() == 0)
     // Reciprocals: exact cases, edges, saturation branches.
+    // (v0.4.1: exactly rounded by one i64 division — the old Newton
+    // values below changed by up to 16384 ulp.)
     assert!(Q15::one().reciprocal().raw() == 32768)
-    assert!(Q15::from_raw(raw: 16384).reciprocal().raw() == 65535)
+    assert!(Q15::from_raw(raw: 16384).reciprocal().raw() == 65536)
     assert!(Q15::from_raw(raw: 65536).reciprocal().raw() == 16384)
     assert!(Q15::zero().reciprocal().raw() == 2147483647)
     assert!(Q15::from_raw(raw: -65536).reciprocal().raw() == -16384)
-    assert!(Q15::from_raw(raw: 10923).reciprocal().raw() == 98302)
+    assert!(Q15::from_raw(raw: 10923).reciprocal().raw() == 98301)
     assert!(Q15::from_raw(raw: 98304).reciprocal().raw() == 10923)
-    assert!(Q15::from_raw(raw: 8192).reciprocal().raw() == 131070)
-    assert!(Q15::from_raw(raw: 1).reciprocal().raw() == 1073725440)
-    assert!(Q15::from_raw(raw: 2).reciprocal().raw() == 536862720)
-    assert!(Q15::from_raw(raw: 7).reciprocal().raw() == 153391104)
+    assert!(Q15::from_raw(raw: 8192).reciprocal().raw() == 131072)
+    assert!(Q15::from_raw(raw: 1).reciprocal().raw() == 1073741824)
+    assert!(Q15::from_raw(raw: 2).reciprocal().raw() == 536870912)
+    assert!(Q15::from_raw(raw: 7).reciprocal().raw() == 153391689)
     assert!(Q15::maximum().reciprocal().raw() == 1)
     assert!(Q15::minimum().reciprocal().raw() == 0)
-    assert!(Q15::from_raw(raw: -1).reciprocal().raw() == -1073725440)
+    assert!(Q15::from_raw(raw: -1).reciprocal().raw() == -1073741824)
+    assert!(Q15::from_raw(raw: -63).reciprocal().raw() == -17043521)
+    assert!(Q15::from_raw(raw: -45).reciprocal().raw() == -23860929)
+    assert!(Q15::from_raw(raw: 98).reciprocal().raw() == 10956549)
     assert!(Q7::from_raw(raw: 256).reciprocal().raw() == 64)
-    assert!(Q7::from_raw(raw: 64).reciprocal().raw() == 255)
+    assert!(Q7::from_raw(raw: 64).reciprocal().raw() == 256)
     assert!(Q7::from_raw(raw: 128).reciprocal().raw() == 128)
+    assert!(Q7::from_raw(raw: 1).reciprocal().raw() == 16384)
+    assert!(Q7::from_raw(raw: 3).reciprocal().raw() == 5461)
+    // Cross-format exactness: Q<5>, Q<10>, Q<30> (Newton had no
+    // coverage here at all).
+    assert!(Q<5>::from_raw(raw: 3).reciprocal().raw() == 341)
+    assert!(Q<10>::from_raw(raw: 7).reciprocal().raw() == 149797)
+    assert!(Q<30>::from_raw(raw: 1).reciprocal().raw() == 2147483647)
+    assert!(Q<30>::from_raw(raw: -3).reciprocal().raw() == -2147483648)
     // Q31: every reciprocal is unrepresentable, so it saturates.
     assert!(Q31::maximum().reciprocal().raw() == 2147483647)
     assert!(Q31::minimum().reciprocal().raw() == -2147483648)
@@ -3209,19 +3244,19 @@ fn scalar_random() {
     // Seeded random raws (seed 20261120): sqrt, reciprocal,
     // and convert_q over 6 format pairs.
     assert!(Q15::from_raw(raw: -11622).sqrt().raw() == 0)
-    assert!(Q15::from_raw(raw: -11622).reciprocal().raw() == -92388)
+    assert!(Q15::from_raw(raw: -11622).reciprocal().raw() == -92389)
     assert!(Q15::from_raw(raw: 5698).sqrt().raw() == 13664)
-    assert!(Q15::from_raw(raw: 5698).reciprocal().raw() == 188444)
+    assert!(Q15::from_raw(raw: 5698).reciprocal().raw() == 188442)
     assert!(Q15::from_raw(raw: 4776).sqrt().raw() == 12510)
     assert!(Q15::from_raw(raw: 4776).reciprocal().raw() == 224820)
     assert!(Q15::from_raw(raw: 10410).sqrt().raw() == 18469)
-    assert!(Q15::from_raw(raw: 10410).reciprocal().raw() == 103144)
+    assert!(Q15::from_raw(raw: 10410).reciprocal().raw() == 103145)
     assert!(Q15::from_raw(raw: 11704).sqrt().raw() == 19584)
-    assert!(Q15::from_raw(raw: 11704).reciprocal().raw() == 91742)
+    assert!(Q15::from_raw(raw: 11704).reciprocal().raw() == 91741)
     assert!(Q15::from_raw(raw: -19774).sqrt().raw() == 0)
     assert!(Q15::from_raw(raw: -19774).reciprocal().raw() == -54301)
     assert!(Q15::from_raw(raw: 3503).sqrt().raw() == 10714)
-    assert!(Q15::from_raw(raw: 3503).reciprocal().raw() == 306520)
+    assert!(Q15::from_raw(raw: 3503).reciprocal().raw() == 306521)
     assert!(Q15::from_raw(raw: -20395).sqrt().raw() == 0)
     assert!(Q15::from_raw(raw: -20395).reciprocal().raw() == -52647)
     assert!(Q15::from_raw(raw: -18696).sqrt().raw() == 0)
@@ -3229,17 +3264,17 @@ fn scalar_random() {
     assert!(Q15::from_raw(raw: -25743).sqrt().raw() == 0)
     assert!(Q15::from_raw(raw: -25743).reciprocal().raw() == -41710)
     assert!(Q15::from_raw(raw: -63).sqrt().raw() == 0)
-    assert!(Q15::from_raw(raw: -63).reciprocal().raw() == -17043456)
+    assert!(Q15::from_raw(raw: -63).reciprocal().raw() == -17043521)
     assert!(Q15::from_raw(raw: -45).sqrt().raw() == 0)
-    assert!(Q15::from_raw(raw: -45).reciprocal().raw() == -23860736)
+    assert!(Q15::from_raw(raw: -45).reciprocal().raw() == -23860929)
     assert!(Q15::from_raw(raw: 98).sqrt().raw() == 1792)
-    assert!(Q15::from_raw(raw: 98).reciprocal().raw() == 10956544)
+    assert!(Q15::from_raw(raw: 98).reciprocal().raw() == 10956549)
     assert!(Q15::from_raw(raw: -597495732).sqrt().raw() == 0)
     assert!(Q15::from_raw(raw: -597495732).reciprocal().raw() == -2)
     assert!(Q15::from_raw(raw: -8539352).sqrt().raw() == 0)
     assert!(Q15::from_raw(raw: -8539352).reciprocal().raw() == -126)
     assert!(Q15::from_raw(raw: 1).sqrt().raw() == 181)
-    assert!(Q15::from_raw(raw: 1).reciprocal().raw() == 1073725440)
+    assert!(Q15::from_raw(raw: 1).reciprocal().raw() == 1073741824)
     let c0: Q7 = convert_q(x: Q15::from_raw(raw: -11622))
     assert!(c0.raw() == -45)
     let c1: Q31 = convert_q(x: Q15::from_raw(raw: -11622))
@@ -3360,4 +3395,769 @@ fn scalar_random() {
     assert!(c58.raw() == -1)
     let c59: Q15 = convert_q(x: Q<0>::from_raw(raw: -25743))
     assert!(c59.raw() == -843546624)
+}
+#[test]
+fn fft_taylor_green_slice() {
+    // 1D slice of the Taylor-Green vorticity field w = 2 sin x sin y
+    // at sin y = 1: x[n] = 2 sin(2*pi*n/N), amplitude exactly 2.0 in
+    // Q15. Its DFT has exactly two non-zero bins: bin 1 = -i*N and
+    // bin N-1 = +i*N (Q15 values), i.e. im raws -/+ N*32768; every
+    // other bin is zero in exact arithmetic. Expected values below
+    // are from the independent oracle (`tools/gen_vectors.py`,
+    // `taylor_green`): the mirrored fixed-point FFT, cross-checked
+    // against an independent float DFT (<= 32 ulp) and by round-trip
+    // (<= 4 ulp). The small residuals in the other bins are input /
+    // twiddle quantization, not signal: at N=64 the largest
+    // non-peak component is 14 ulp on a peak of 2097152.
+    // --- N = 16: peak bins (0, -524288) and (0, 524288) ---
+    let tg16: [Q15; 16] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 25080),
+        Q15::from_raw(raw: 46341),
+        Q15::from_raw(raw: 60547),
+        Q15::from_raw(raw: 65536),
+        Q15::from_raw(raw: 60547),
+        Q15::from_raw(raw: 46341),
+        Q15::from_raw(raw: 25080),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -25080),
+        Q15::from_raw(raw: -46341),
+        Q15::from_raw(raw: -60547),
+        Q15::from_raw(raw: -65536),
+        Q15::from_raw(raw: -60547),
+        Q15::from_raw(raw: -46341),
+        Q15::from_raw(raw: -25080),
+    ]
+    let spec16 = fft16(x: to_cplx(xs: tg16))
+    assert_cplx_frame(
+        got: spec16,
+        want_re: [0, -1, 0, 2, 0, -2, 0, 1, 0, 1, 0, -2, 0, 2, 0, -1],
+        want_im: [0, -524286, 0, -1, 0, -5, 0, -2, 0, 2, 0, 5, 0, 1, 0, 524286],
+    )
+    assert_q15_frame(
+        got: fft_magnitude(x: spec16),
+        want: [0, 524286, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 524286],
+    )
+    // Analytic property: only bins 1 and 15 carry signal;
+    // every other bin stays within 32 ulp of zero, and the two
+    // peak bins land within 32 ulp of -/+ N*32768.
+    assert!(spec16[1].re().raw() >= -32)
+    assert!(spec16[1].re().raw() <= 32)
+    assert!(spec16[1].im().raw() >= -524320)
+    assert!(spec16[1].im().raw() <= -524256)
+    assert!(spec16[15].re().raw() >= -32)
+    assert!(spec16[15].re().raw() <= 32)
+    assert!(spec16[15].im().raw() >= 524256)
+    assert!(spec16[15].im().raw() <= 524320)
+    var k16: usize = 0
+    while k16 < 16 {
+        if k16 != 1 {
+            if k16 != 15 {
+                assert!(spec16[k16].re().raw() >= -32)
+                assert!(spec16[k16].re().raw() <= 32)
+                assert!(spec16[k16].im().raw() >= -32)
+                assert!(spec16[k16].im().raw() <= 32)
+            }
+        }
+        k16 += 1
+    }
+    assert_parseval(x: tg16, spec: spec16)
+    // Round-trip within 4 ulp (oracle `roundtrip` / `roundtrip_im`).
+    let back16 = ifft16(x: spec16)
+    assert_cplx_frame(
+        got: back16,
+        want_re: [
+            0,
+            25080,
+            46339,
+            60547,
+            65536,
+            60548,
+            46339,
+            25080,
+            0,
+            -25080,
+            -46339,
+            -60547,
+            -65536,
+            -60548,
+            -46339,
+            -25080,
+        ],
+        want_im: [0, -1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, -1],
+    )
+    // --- N = 32: peak bins (0, -1048576) and (0, 1048576) ---
+    let tg32: [Q15; 32] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 12785),
+        Q15::from_raw(raw: 25080),
+        Q15::from_raw(raw: 36410),
+        Q15::from_raw(raw: 46341),
+        Q15::from_raw(raw: 54491),
+        Q15::from_raw(raw: 60547),
+        Q15::from_raw(raw: 64277),
+        Q15::from_raw(raw: 65536),
+        Q15::from_raw(raw: 64277),
+        Q15::from_raw(raw: 60547),
+        Q15::from_raw(raw: 54491),
+        Q15::from_raw(raw: 46341),
+        Q15::from_raw(raw: 36410),
+        Q15::from_raw(raw: 25080),
+        Q15::from_raw(raw: 12785),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -12785),
+        Q15::from_raw(raw: -25080),
+        Q15::from_raw(raw: -36410),
+        Q15::from_raw(raw: -46341),
+        Q15::from_raw(raw: -54491),
+        Q15::from_raw(raw: -60547),
+        Q15::from_raw(raw: -64277),
+        Q15::from_raw(raw: -65536),
+        Q15::from_raw(raw: -64277),
+        Q15::from_raw(raw: -60547),
+        Q15::from_raw(raw: -54491),
+        Q15::from_raw(raw: -46341),
+        Q15::from_raw(raw: -36410),
+        Q15::from_raw(raw: -25080),
+        Q15::from_raw(raw: -12785),
+    ]
+    let spec32 = fft32(x: to_cplx(xs: tg32))
+    assert_cplx_frame(
+        got: spec32,
+        want_re: [
+            0,
+            -7,
+            0,
+            7,
+            0,
+            -5,
+            0,
+            -4,
+            0,
+            6,
+            0,
+            1,
+            0,
+            -3,
+            0,
+            5,
+            0,
+            5,
+            0,
+            -3,
+            0,
+            1,
+            0,
+            6,
+            0,
+            -4,
+            0,
+            -5,
+            0,
+            7,
+            0,
+            -7,
+        ],
+        want_im: [
+            0,
+            -1048567,
+            0,
+            2,
+            0,
+            -5,
+            0,
+            0,
+            0,
+            4,
+            0,
+            5,
+            0,
+            4,
+            0,
+            5,
+            0,
+            -5,
+            0,
+            -4,
+            0,
+            -5,
+            0,
+            -4,
+            0,
+            0,
+            0,
+            5,
+            0,
+            -2,
+            0,
+            1048567,
+        ],
+    )
+    assert_q15_frame(
+        got: fft_magnitude(x: spec32),
+        want: [
+            0,
+            1048567,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1048567,
+        ],
+    )
+    // Analytic property: only bins 1 and 31 carry signal;
+    // every other bin stays within 32 ulp of zero, and the two
+    // peak bins land within 32 ulp of -/+ N*32768.
+    assert!(spec32[1].re().raw() >= -32)
+    assert!(spec32[1].re().raw() <= 32)
+    assert!(spec32[1].im().raw() >= -1048608)
+    assert!(spec32[1].im().raw() <= -1048544)
+    assert!(spec32[31].re().raw() >= -32)
+    assert!(spec32[31].re().raw() <= 32)
+    assert!(spec32[31].im().raw() >= 1048544)
+    assert!(spec32[31].im().raw() <= 1048608)
+    var k32: usize = 0
+    while k32 < 32 {
+        if k32 != 1 {
+            if k32 != 31 {
+                assert!(spec32[k32].re().raw() >= -32)
+                assert!(spec32[k32].re().raw() <= 32)
+                assert!(spec32[k32].im().raw() >= -32)
+                assert!(spec32[k32].im().raw() <= 32)
+            }
+        }
+        k32 += 1
+    }
+    assert_parseval(x: tg32, spec: spec32)
+    // Round-trip within 4 ulp (oracle `roundtrip` / `roundtrip_im`).
+    let back32 = ifft32(x: spec32)
+    assert_cplx_frame(
+        got: back32,
+        want_re: [
+            0,
+            12784,
+            25080,
+            36410,
+            46339,
+            54489,
+            60547,
+            64275,
+            65536,
+            64276,
+            60548,
+            54492,
+            46339,
+            36410,
+            25080,
+            12785,
+            0,
+            -12784,
+            -25080,
+            -36409,
+            -46339,
+            -54489,
+            -60547,
+            -64275,
+            -65536,
+            -64276,
+            -60548,
+            -54492,
+            -46339,
+            -36410,
+            -25080,
+            -12785,
+        ],
+        want_im: [
+            0,
+            0,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            -1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            1,
+            0,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            -1,
+            0,
+        ],
+    )
+    // --- N = 64: peak bins (0, -2097152) and (0, 2097152) ---
+    let tg64: [Q15; 64] = [
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: 6424),
+        Q15::from_raw(raw: 12785),
+        Q15::from_raw(raw: 19024),
+        Q15::from_raw(raw: 25080),
+        Q15::from_raw(raw: 30893),
+        Q15::from_raw(raw: 36410),
+        Q15::from_raw(raw: 41576),
+        Q15::from_raw(raw: 46341),
+        Q15::from_raw(raw: 50660),
+        Q15::from_raw(raw: 54491),
+        Q15::from_raw(raw: 57798),
+        Q15::from_raw(raw: 60547),
+        Q15::from_raw(raw: 62714),
+        Q15::from_raw(raw: 64277),
+        Q15::from_raw(raw: 65220),
+        Q15::from_raw(raw: 65536),
+        Q15::from_raw(raw: 65220),
+        Q15::from_raw(raw: 64277),
+        Q15::from_raw(raw: 62714),
+        Q15::from_raw(raw: 60547),
+        Q15::from_raw(raw: 57798),
+        Q15::from_raw(raw: 54491),
+        Q15::from_raw(raw: 50660),
+        Q15::from_raw(raw: 46341),
+        Q15::from_raw(raw: 41576),
+        Q15::from_raw(raw: 36410),
+        Q15::from_raw(raw: 30893),
+        Q15::from_raw(raw: 25080),
+        Q15::from_raw(raw: 19024),
+        Q15::from_raw(raw: 12785),
+        Q15::from_raw(raw: 6424),
+        Q15::from_raw(raw: 0),
+        Q15::from_raw(raw: -6424),
+        Q15::from_raw(raw: -12785),
+        Q15::from_raw(raw: -19024),
+        Q15::from_raw(raw: -25080),
+        Q15::from_raw(raw: -30893),
+        Q15::from_raw(raw: -36410),
+        Q15::from_raw(raw: -41576),
+        Q15::from_raw(raw: -46341),
+        Q15::from_raw(raw: -50660),
+        Q15::from_raw(raw: -54491),
+        Q15::from_raw(raw: -57798),
+        Q15::from_raw(raw: -60547),
+        Q15::from_raw(raw: -62714),
+        Q15::from_raw(raw: -64277),
+        Q15::from_raw(raw: -65220),
+        Q15::from_raw(raw: -65536),
+        Q15::from_raw(raw: -65220),
+        Q15::from_raw(raw: -64277),
+        Q15::from_raw(raw: -62714),
+        Q15::from_raw(raw: -60547),
+        Q15::from_raw(raw: -57798),
+        Q15::from_raw(raw: -54491),
+        Q15::from_raw(raw: -50660),
+        Q15::from_raw(raw: -46341),
+        Q15::from_raw(raw: -41576),
+        Q15::from_raw(raw: -36410),
+        Q15::from_raw(raw: -30893),
+        Q15::from_raw(raw: -25080),
+        Q15::from_raw(raw: -19024),
+        Q15::from_raw(raw: -12785),
+        Q15::from_raw(raw: -6424),
+    ]
+    let spec64 = fft64(x: to_cplx(xs: tg64))
+    assert_cplx_frame(
+        got: spec64,
+        want_re: [
+            0,
+            -19,
+            0,
+            14,
+            0,
+            -14,
+            0,
+            -10,
+            0,
+            9,
+            0,
+            3,
+            0,
+            -7,
+            0,
+            12,
+            0,
+            -2,
+            0,
+            1,
+            0,
+            -1,
+            0,
+            3,
+            0,
+            2,
+            0,
+            4,
+            0,
+            0,
+            0,
+            5,
+            0,
+            5,
+            0,
+            0,
+            0,
+            4,
+            0,
+            2,
+            0,
+            3,
+            0,
+            -1,
+            0,
+            1,
+            0,
+            -2,
+            0,
+            12,
+            0,
+            -7,
+            0,
+            3,
+            0,
+            9,
+            0,
+            -10,
+            0,
+            -14,
+            0,
+            14,
+            0,
+            -19,
+        ],
+        want_im: [
+            0,
+            -2097125,
+            0,
+            1,
+            0,
+            2,
+            0,
+            -4,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            -10,
+            0,
+            -8,
+            0,
+            -9,
+            0,
+            -7,
+            0,
+            -4,
+            0,
+            12,
+            0,
+            -3,
+            0,
+            9,
+            0,
+            -9,
+            0,
+            3,
+            0,
+            -12,
+            0,
+            4,
+            0,
+            7,
+            0,
+            9,
+            0,
+            8,
+            0,
+            10,
+            0,
+            0,
+            0,
+            0,
+            0,
+            -1,
+            0,
+            -1,
+            0,
+            4,
+            0,
+            -2,
+            0,
+            -1,
+            0,
+            2097125,
+        ],
+    )
+    assert_q15_frame(
+        got: fft_magnitude(x: spec64),
+        want: [
+            0,
+            2097125,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            2097125,
+        ],
+    )
+    // Analytic property: only bins 1 and 63 carry signal;
+    // every other bin stays within 32 ulp of zero, and the two
+    // peak bins land within 32 ulp of -/+ N*32768.
+    assert!(spec64[1].re().raw() >= -32)
+    assert!(spec64[1].re().raw() <= 32)
+    assert!(spec64[1].im().raw() >= -2097184)
+    assert!(spec64[1].im().raw() <= -2097120)
+    assert!(spec64[63].re().raw() >= -32)
+    assert!(spec64[63].re().raw() <= 32)
+    assert!(spec64[63].im().raw() >= 2097120)
+    assert!(spec64[63].im().raw() <= 2097184)
+    var k64: usize = 0
+    while k64 < 64 {
+        if k64 != 1 {
+            if k64 != 63 {
+                assert!(spec64[k64].re().raw() >= -32)
+                assert!(spec64[k64].re().raw() <= 32)
+                assert!(spec64[k64].im().raw() >= -32)
+                assert!(spec64[k64].im().raw() <= 32)
+            }
+        }
+        k64 += 1
+    }
+    assert_parseval(x: tg64, spec: spec64)
+    // Round-trip within 4 ulp (oracle `roundtrip` / `roundtrip_im`).
+    let back64 = ifft64(x: spec64)
+    assert_cplx_frame(
+        got: back64,
+        want_re: [
+            0,
+            6423,
+            12784,
+            19023,
+            25080,
+            30893,
+            36410,
+            41575,
+            46339,
+            50658,
+            54489,
+            57796,
+            60547,
+            62713,
+            64275,
+            65217,
+            65536,
+            65219,
+            64276,
+            62713,
+            60548,
+            57800,
+            54492,
+            50660,
+            46339,
+            41575,
+            36410,
+            30893,
+            25080,
+            19024,
+            12785,
+            6425,
+            0,
+            -6423,
+            -12784,
+            -19023,
+            -25080,
+            -30893,
+            -36409,
+            -41575,
+            -46339,
+            -50658,
+            -54489,
+            -57796,
+            -60547,
+            -62713,
+            -64275,
+            -65217,
+            -65536,
+            -65219,
+            -64276,
+            -62713,
+            -60548,
+            -57800,
+            -54492,
+            -50660,
+            -46339,
+            -41575,
+            -36410,
+            -30893,
+            -25080,
+            -19024,
+            -12785,
+            -6425,
+        ],
+        want_im: [
+            0,
+            -1,
+            0,
+            0,
+            -1,
+            0,
+            0,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            -1,
+            -1,
+            0,
+            1,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            0,
+            -1,
+            -1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            -1,
+            0,
+            0,
+            -1,
+            0,
+            0,
+            -1,
+        ],
+    )
 }
