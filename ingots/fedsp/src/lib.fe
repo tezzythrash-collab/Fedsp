@@ -118,7 +118,14 @@ impl<const FRAC: i32> Q<FRAC> {
             let v: i64 = (num as i64) << (FRAC as i64)
             let half: i64 = (den as i64).abs() / 2
             let den64: i64 = den as i64
-            let rounded: i64 = if (v >= 0) == (den > 0) {
+            // Round to nearest, ties away from zero. The adjustment
+            // follows the sign of the *numerator*: with truncating
+            // division, `(v + half) / den` rounds away from zero only
+            // when `v >= 0`; for `v < 0` it must be `(v - half) / den`.
+            // (v0.4.1 audit fix: the old branch keyed on whether `v`
+            // and `den` agreed in sign, which rounded *toward* zero
+            // for every negative denominator.)
+            let rounded: i64 = if v >= 0 {
                 (v + half) / den64
             } else {
                 (v - half) / den64
@@ -273,16 +280,25 @@ impl<const FRAC: i32> Q<FRAC> {
         Self { raw: isqrt_round(x: shifted).downcast_saturate() }
     }
 
-    /// Reciprocal `1 / self`, by Newton iteration (5 fixed steps).
-    /// Rounds to nearest (ties toward +inf) and saturates on overflow.
-    /// `reciprocal(0) == maximum()` (the div-by-zero rule). The sign of
-    /// a negative input is applied after the iteration, so a saturated
-    /// positive reciprocal negates to `-maximum()`, not `minimum()`.
+    /// Reciprocal `1 / self`, exactly rounded to nearest (ties toward
+    /// +inf) and saturating on overflow. `reciprocal(0) == maximum()`
+    /// (the div-by-zero rule). Computed with a single `i64` division:
+    /// `1 / x` in Q<FRAC> has raw `2^(2*FRAC) / raw`, and
+    /// `2^(2*FRAC) <= 2^62` fits in `i64` for every `FRAC <= 31`, so
+    /// no iteration is needed and the result is exact — 0 ulp — on
+    /// every input, not ~1-2 ulp. (v0.4.1 audit fix: the old 5-step
+    /// Newton iteration was ~1 ulp of the *normalized* reciprocal, but
+    /// the final rescale by `2^k` amplified that to as much as
+    /// `2^k` ulp — 16384 ulp for Q15 `raw == 1` — while the docs
+    /// claimed ~1-2 ulp.)
+    ///
     /// For `Q<31>` every reciprocal is unrepresentable (`|1/x| > 1` for
     /// all `|x| < 1`), so it saturates to `maximum()` / `minimum()` by
     /// sign. For `Q<0>` the result is the truncated integer reciprocal
-    /// (`-1`, `0`, or `1`). Newton converges to within ~1-2 ulp of the
-    /// true reciprocal; the exact result is pinned by the oracle.
+    /// (`-1`, `0`, or `1`). A saturated positive reciprocal negates to
+    /// `-maximum()`, not `minimum()`; and rounding is done on the
+    /// signed quotient directly, so the exact tie `1 / -65536 == -0.5`
+    /// rounds toward +inf to `0`, not `-1`.
     pub fn reciprocal(self) -> Self {
         if self.raw == 0 {
             return Self::maximum()
@@ -299,41 +315,20 @@ impl<const FRAC: i32> Q<FRAC> {
             }
             return Self::maximum()
         }
-        // Normalize |raw| into [2^(FRAC-1), 2^FRAC) by shifting, so the
-        // Newton iteration starts with x' in [0.5, 1).
-        var m: i64 = (self.raw as i64).abs()
-        var k: i32 = 0
-        while m < (1 << ((FRAC as i64) - 1)) {
-            m = m << 1
-            k = k + 1
-        }
-        while m >= (1 << (FRAC as i64)) {
-            m = m >> 1
-            k = k - 1
-        }
-        let x_prime: Self = Self::from_raw(raw: m.downcast_truncate())
-        // y <- y + y * (1 - x' * y), 5 fixed iterations from y0 = 1.5.
-        // The error squares each step (e <- x' * e^2), so 5 steps leave
-        // an error far below 1 ulp; the remaining ~1 ulp is rounding
-        // noise from the saturating multiplies, pinned by the oracle.
-        var y: Self = Self::from_ratio(num: 3, den: 2)
-        var it: i32 = 0
-        while it < 5 {
-            let prod: Self = x_prime.sat_mul(other: y)
-            let one_minus: Self = Self::one().sat_sub(other: prod)
-            y = y.sat_add(other: y.sat_mul(other: one_minus))
-            it += 1
-        }
-        // 1/x = y' * 2^k: shift left (saturating) or right (rounded).
-        let y_raw: i64 = if k >= 0 {
-            (y.raw() as i64) << (k as i64)
+        // Exact: round-half-up (ties toward +inf) of 2^(2*FRAC) / raw.
+        let num: i64 = 1 << (2 * (FRAC as i64))
+        let den: i64 = self.raw as i64
+        let rounded: i64 = if den > 0 {
+            (num + den / 2) / den
         } else {
-            let d: i64 = (-k) as i64
-            let half: i64 = 1 << (d - 1)
-            ((y.raw() as i64) + half) >> d
+            // Negative denominator: floor(num / den + 1/2) via quotient
+            // and remainder — the tie rounds toward +inf, not away.
+            let m: i64 = -den
+            let q: i64 = num / m
+            let r: i64 = num % m
+            if 2 * r > m { -(q + 1) } else { -q }
         }
-        let out: Self = Self { raw: y_raw.downcast_saturate() }
-        if self.raw < 0 { out.sat_neg() } else { out }
+        Self { raw: rounded.downcast_saturate() }
     }
 }
 
@@ -810,7 +805,12 @@ pub fn isqrt_round(x: i64) -> i64 {
 
 /// Mean of a Q15 frame, rounding to nearest (ties toward +inf) and
 /// saturating on overflow. The sum accumulates in `i64` with saturation.
+/// The mean of an empty frame is zero by convention (it avoids a
+/// division by zero — v0.4.1 audit fix: it used to trap).
 pub fn mean<const N: usize>(x: [Q15; N]) -> Q15 {
+    if N == 0 {
+        return Q15::zero()
+    }
     var acc: i64 = 0
     var i: usize = 0
     while i < N {
@@ -838,8 +838,13 @@ pub fn energy<const N: usize>(x: [Q15; N]) -> Q15 {
 
 /// Root-mean-square of a Q15 frame: the square root of the mean of the
 /// squares, rounding to nearest. The sum of squares accumulates in `i64`
-/// with saturation, so `rms` never reverts.
+/// with saturation, so `rms` never reverts. The RMS of an empty frame is
+/// zero by convention (v0.4.1 audit fix: it used to trap on division
+/// by zero).
 pub fn rms<const N: usize>(x: [Q15; N]) -> Q15 {
+    if N == 0 {
+        return Q15::zero()
+    }
     var acc: i64 = 0
     var i: usize = 0
     while i < N {
@@ -917,8 +922,13 @@ impl<const N: usize> Fir<N> {
     }
 
     /// One sample step: shift the delay line, then `dot(taps, delay)`.
-    /// Returns the output sample.
+    /// Returns the output sample. A zero-tap filter returns zero
+    /// (the dot of two empty vectors — v0.4.1 audit fix: it used to
+    /// trap indexing the empty delay line).
     pub fn step(self: mut Self, x: Q15) -> Q15 {
+        if N == 0 {
+            return Q15::zero()
+        }
         var d: [Q15; N] = [Q15::zero(); N]
         d[0] = x
         var i: usize = 1
