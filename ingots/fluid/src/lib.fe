@@ -1,0 +1,697 @@
+// Fluid — fixed-point 2D spectral fluid demo (Step 4, Clay mapping).
+//
+// Ports the 2D Taylor-Green pseudo-spectral solver
+// (~/workspace/millennium/navier-stokes-2d/taylor_green_2d.py, Task 1;
+// perturbed field from perturbed_convergence.py) to Fe fixed-point
+// (Q15) as a demo ingot.
+//
+// Problem: periodic [0, 2*pi)^2, vorticity-streamfunction form,
+// pseudo-spectral with 2/3 de-aliasing, RK4, nu = 1/100, dt = 0.004.
+// State is the spectral vorticity `w_hat` as a flat row-major
+// [Cplx; 1024] array (N = 32), FFT ordering.
+//
+// Exactness contract: every operation mirrors the Python oracle in
+// `tools/fluid_oracle.py` operation for operation, using the same
+// library primitives (`Q15::sat_mul`, `Q15::from_ratio`,
+// `Q15::reciprocal`, saturating adds). The oracle's fixed-point
+// trajectory is the exact expected value for the tests below: if Fe
+// disagrees with the oracle by even 1 raw unit, the Fe code (or the
+// mirror) is wrong. The oracle also runs the float reference solver
+// side by side; the round-off report lives in
+// `tools/fluid_oracle.json` (10-step: energy ~1.2e-05, wmax ~6e-06,
+// BKM ~1.5e-04 relative to float).
+//
+// Known limits (honest, not hidden):
+// - N = 32 only. N = 64 would need [Cplx; 4096] state and fft64
+//   2D transforms; the Python oracle covers N = 64 round-off, but
+//   no Fe N = 64 solver is built here.
+// - The Taylor-Green field is a degenerate test ((u.grad)w = 0, a
+//   pure diffusion eigenmode); the perturbed field is the honest
+//   convergence test. Both are asserted exactly below.
+// - Native backend: the full suite takes ~2 min (the 250-step tests
+//   take ~85 s each, over the 60 s default `--native-timeout-secs`
+//   — run with `--native-timeout-secs 600`, as CI does). `fe check`
+//   is ~5 s. Iterate on native.
+// - Sonatina backend: NOT practically runnable for this ingot. The
+//   probe-only ingot compiled in ~4 min and the 2D FFT probe PASSED
+//   on sonatina, but the full solver ingot ran 30+ min twice with no
+//   output (~2.5 GB RSS) and never finished in this environment — the
+//   sonatina codegen for [Cplx; 1024] value semantics is
+//   pathologically slow, and the 250-step tests would need hours of
+//   EVM execution on top. The solver is therefore verified natively
+//   (exact), and CI scopes its sonatina step to fedsp + demo (see
+//   .github/workflows/ci.yml). This is a toolchain limitation, not a
+//   code error: the same code compiles natively in ~20 s and passes
+//   every test bit-for-bit against the oracle.
+
+use fedsp::{Cplx, Q15, fft32, ifft32}
+
+/// FFT-ordered wavenumbers for N = 32: index i -> i for i < 16,
+/// i - 32 otherwise. As a table so no usize/i32 casts are needed.
+const K: [i32; 32] = [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    -16,
+    -15,
+    -14,
+    -13,
+    -12,
+    -11,
+    -10,
+    -9,
+    -8,
+    -7,
+    -6,
+    -5,
+    -4,
+    -3,
+    -2,
+    -1,
+]
+
+/// dt = 4/1000 as a Q15 raw: `Q15::from_ratio(4, 1000) == 131`.
+const DT_RAW: i32 = 131
+
+/// 2D FFT (N=32) on a flat row-major [Cplx; 1024] field: FFT each row,
+/// then FFT each column. Unscaled forward transform, like `fft32`.
+fn fft2_32(x: [Cplx; 1024]) -> [Cplx; 1024] {
+    var a: [Cplx; 1024] = x
+    // Rows: x index r*32 + c.
+    var r: usize = 0
+    while r < 32 {
+        var row: [Cplx; 32] = [Cplx::zero(); 32]
+        var c: usize = 0
+        while c < 32 {
+            row[c] = a[r * 32 + c]
+            c += 1
+        }
+        let fr = fft32(x: row)
+        c = 0
+        while c < 32 {
+            a[r * 32 + c] = fr[c]
+            c += 1
+        }
+        r += 1
+    }
+    // Columns: x index r*32 + c, stride 32.
+    var c2: usize = 0
+    while c2 < 32 {
+        var col: [Cplx; 32] = [Cplx::zero(); 32]
+        var r2: usize = 0
+        while r2 < 32 {
+            col[r2] = a[r2 * 32 + c2]
+            r2 += 1
+        }
+        let fc = fft32(x: col)
+        r2 = 0
+        while r2 < 32 {
+            a[r2 * 32 + c2] = fc[r2]
+            r2 += 1
+        }
+        c2 += 1
+    }
+    a
+}
+
+/// 2D inverse FFT (N=32): inverse-FFT each row, then each column.
+fn ifft2_32(x: [Cplx; 1024]) -> [Cplx; 1024] {
+    var a: [Cplx; 1024] = x
+    var r: usize = 0
+    while r < 32 {
+        var row: [Cplx; 32] = [Cplx::zero(); 32]
+        var c: usize = 0
+        while c < 32 {
+            row[c] = a[r * 32 + c]
+            c += 1
+        }
+        let fr = ifft32(x: row)
+        c = 0
+        while c < 32 {
+            a[r * 32 + c] = fr[c]
+            c += 1
+        }
+        r += 1
+    }
+    var c2: usize = 0
+    while c2 < 32 {
+        var col: [Cplx; 32] = [Cplx::zero(); 32]
+        var r2: usize = 0
+        while r2 < 32 {
+            col[r2] = a[r2 * 32 + c2]
+            r2 += 1
+        }
+        let fc = ifft32(x: col)
+        r2 = 0
+        while r2 < 32 {
+            a[r2 * 32 + c2] = fc[r2]
+            r2 += 1
+        }
+        c2 += 1
+    }
+    a
+}
+
+/// Q15 reciprocal of K2 = kx^2 + ky^2 as a raw (0 for the zero mode).
+/// Mirrors the oracle's `q_reciprocal(k2 << 15, 15)`: the input is a
+/// Q15 value holding the integer k2, so the reciprocal's raw is the
+/// Q15 raw of 1/k2.
+fn inv_k2(k2: i32) -> i32 {
+    if k2 == 0 {
+        0
+    } else {
+        Q15::from_raw(raw: k2 << 15).reciprocal().raw()
+    }
+}
+
+/// Diffusion coefficient nu*K2 with nu = 1/100, as a Q15 raw.
+/// Mirrors the oracle's `from_ratio(k2, 100, 15)`.
+fn diff_coeff(k2: i32) -> i32 {
+    Q15::from_ratio(num: k2, den: 100).raw()
+}
+
+/// 2/3 de-aliasing mask: keep modes with |kx| <= 10 and |ky| <= 10
+/// (N//3 = 10). Mirrors the oracle's `deal` table.
+fn dealias(kx: i32, ky: i32) -> bool {
+    let ax: i32 = if kx < 0 { -kx } else { kx }
+    let ay: i32 = if ky < 0 { -ky } else { ky }
+    ax <= 10 && ay <= 10
+}
+
+/// Complex Q15 times a real Q15 scalar: both components `sat_mul`.
+/// Mirrors the oracle's `cplx_mul_real`.
+fn cplx_mul_real(a: Cplx, s: Q15) -> Cplx {
+    Cplx::new(re: a.re().sat_mul(other: s), im: a.im().sat_mul(other: s))
+}
+
+/// Multiply a complex value by `i*k`, where k is a Q15 raw holding
+/// an integer: (re, im) -> (-im*k, re*k). Negation is saturating,
+/// products are `sat_mul`. Mirrors the oracle's `cplx_mul_i`.
+fn cplx_mul_i(a: Cplx, k: Q15) -> Cplx {
+    Cplx::new(
+        re: a.im().sat_neg().sat_mul(other: k),
+        im: a.re().sat_mul(other: k),
+    )
+}
+
+/// Multiply a complex value by `-i*k`: (re, im) -> (im*k, -re*k).
+/// Mirrors the oracle's `cplx_mul_neg_i`.
+fn cplx_mul_neg_i(a: Cplx, k: Q15) -> Cplx {
+    Cplx::new(
+        re: a.im().sat_mul(other: k),
+        im: a.re().sat_neg().sat_mul(other: k),
+    )
+}
+
+/// Componentwise saturating negation. Mirrors the oracle's `cplx_neg`.
+fn cplx_neg(a: Cplx) -> Cplx {
+    Cplx::new(re: a.re().sat_neg(), im: a.im().sat_neg())
+}
+
+/// `x * dt`, dt = Q15 raw 131: identical to `sat_mul(x, 131, 15)`.
+/// Mirrors the oracle's `mul_dt`.
+fn mul_dt(x: i32) -> i32 {
+    Q15::from_raw(raw: x).sat_mul(other: Q15::from_raw(raw: DT_RAW)).raw()
+}
+
+/// `x * dt/2 = x*131/65536`, round-half-up (ties toward +inf),
+/// saturating. Mirrors the oracle's `mul_dt_half` exactly.
+fn mul_dt_half(x: i32) -> i32 {
+    let v: i64 = (x as i64) * 131
+    ((v + 32768) >> 16).downcast_saturate()
+}
+
+/// `x * dt/6 = x*131/196608`, round-half-up (ties toward +inf),
+/// saturating, with truncating division. Mirrors the oracle's
+/// `mul_dt_sixth` exactly.
+fn mul_dt_sixth(x: i32) -> i32 {
+    let num: i64 = (x as i64) * 131
+    let half: i64 = 98304
+    let den: i64 = 196608
+    if num >= 0 {
+        ((num + half) / den).downcast_saturate()
+    } else {
+        ((num - half) / den).downcast_saturate()
+    }
+}
+
+/// Right-hand side of the vorticity equation in spectral space:
+/// `rhs = -(u.wx + v.wy) - nu*K2*w_hat`, with the nonlinear term
+/// computed in physical space, fft2'd, and 2/3 de-aliased.
+/// Mirrors the oracle's `FixedSolver.rhs` operation for operation.
+/// (The velocity block below is duplicated in `diagnostics`, exactly
+/// as the oracle duplicates it: an earlier factored version returned
+/// the two [Cplx; 1024] arrays in a struct, and the sonatina
+/// backend's codegen for that struct return was pathologically slow.)
+pub fn rhs(w_hat: [Cplx; 1024]) -> [Cplx; 1024] {
+    // Velocity spectral fields: psi_hat = w_hat / K2,
+    // u_hat = i*ky*psi_hat, v_hat = -i*kx*psi_hat.
+    var u_hat: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var v_hat: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var r: usize = 0
+    while r < 32 {
+        let ky: i32 = K[r]
+        let ky_q: Q15 = Q15::from_raw(raw: ky << 15)
+        var c: usize = 0
+        while c < 32 {
+            let kx: i32 = K[c]
+            let kx_q: Q15 = Q15::from_raw(raw: kx << 15)
+            let idx: usize = r * 32 + c
+            let k2: i32 = kx * kx + ky * ky
+            let psi: Cplx = cplx_mul_real(a: w_hat[idx], s: Q15::from_raw(raw: inv_k2(k2: k2)))
+            u_hat[idx] = cplx_mul_i(a: psi, k: ky_q)
+            v_hat[idx] = cplx_mul_neg_i(a: psi, k: kx_q)
+            c += 1
+        }
+        r += 1
+    }
+    // Gradient hats: wx_hat = i*kx*w_hat, wy_hat = i*ky*w_hat.
+    var wx_hat: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var wy_hat: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var r: usize = 0
+    while r < 32 {
+        let ky_q: Q15 = Q15::from_raw(raw: K[r] << 15)
+        var c: usize = 0
+        while c < 32 {
+            let kx_q: Q15 = Q15::from_raw(raw: K[c] << 15)
+            let idx: usize = r * 32 + c
+            wx_hat[idx] = cplx_mul_i(a: w_hat[idx], k: kx_q)
+            wy_hat[idx] = cplx_mul_i(a: w_hat[idx], k: ky_q)
+            c += 1
+        }
+        r += 1
+    }
+    // Physical fields: real parts of the inverse transforms.
+    let u_full: [Cplx; 1024] = ifft2_32(x: u_hat)
+    let v_full: [Cplx; 1024] = ifft2_32(x: v_hat)
+    let wx_full: [Cplx; 1024] = ifft2_32(x: wx_hat)
+    let wy_full: [Cplx; 1024] = ifft2_32(x: wy_hat)
+    // Nonlinear term (u.wx + v.wy) in physical space, real only.
+    var nl: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var i: usize = 0
+    while i < 1024 {
+        let t: Q15 = u_full[i]
+            .re()
+            .sat_mul(other: wx_full[i].re())
+            .sat_add(other: v_full[i].re().sat_mul(other: wy_full[i].re()))
+        nl[i] = Cplx::from_re(re: t)
+        i += 1
+    }
+    let nl_hat: [Cplx; 1024] = fft2_32(x: nl)
+    // Combine: out = -nl_hat - nu*K2*w_hat on kept modes, else 0.
+    var out: [Cplx; 1024] = [Cplx::zero(); 1024]
+    r = 0
+    while r < 32 {
+        let ky: i32 = K[r]
+        var c: usize = 0
+        while c < 32 {
+            let kx: i32 = K[c]
+            let idx: usize = r * 32 + c
+            if dealias(kx: kx, ky: ky) {
+                let k2: i32 = kx * kx + ky * ky
+                let d: Cplx = cplx_mul_real(
+                    a: w_hat[idx],
+                    s: Q15::from_raw(raw: diff_coeff(k2: k2)),
+                )
+                let neg: Cplx = cplx_neg(a: nl_hat[idx])
+                out[idx] = Cplx::new(
+                    re: neg.re().sat_sub(other: d.re()),
+                    im: neg.im().sat_sub(other: d.im()),
+                )
+            } else {
+                out[idx] = Cplx::zero()
+            }
+            c += 1
+        }
+        r += 1
+    }
+    out
+}
+
+/// `w + f(k)` componentwise, where f is `mul_dt` (half = false) or
+/// `mul_dt_half` (half = true). Mirrors the oracle's `add_scaled`.
+fn add_scaled(w: [Cplx; 1024], k: [Cplx; 1024], half: bool) -> [Cplx; 1024] {
+    var out: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var i: usize = 0
+    while i < 1024 {
+        let kr: i32 = if half {
+            mul_dt_half(x: k[i].re().raw())
+        } else {
+            mul_dt(x: k[i].re().raw())
+        }
+        let ki: i32 = if half {
+            mul_dt_half(x: k[i].im().raw())
+        } else {
+            mul_dt(x: k[i].im().raw())
+        }
+        out[i] = Cplx::new(
+            re: w[i].re().sat_add(other: Q15::from_raw(raw: kr)),
+            im: w[i].im().sat_add(other: Q15::from_raw(raw: ki)),
+        )
+        i += 1
+    }
+    out
+}
+
+/// One RK4 step. Mirrors the oracle's `FixedSolver.step`: the stage
+/// sum S = k1 + 2*k2 + 2*k3 + k4 doubles via saturating add with the
+/// oracle's exact grouping, then `w += mul_dt_sixth(S)`.
+pub fn rk4_step(w: [Cplx; 1024]) -> [Cplx; 1024] {
+    let k1: [Cplx; 1024] = rhs(w_hat: w)
+    let k2: [Cplx; 1024] = rhs(w_hat: add_scaled(w: w, k: k1, half: true))
+    let k3: [Cplx; 1024] = rhs(w_hat: add_scaled(w: w, k: k2, half: true))
+    let k4: [Cplx; 1024] = rhs(w_hat: add_scaled(w: w, k: k3, half: false))
+    var out: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var i: usize = 0
+    while i < 1024 {
+        let sr: i32 = k1[i]
+            .re()
+            .sat_add(other: k2[i].re().sat_add(other: k2[i].re()))
+            .sat_add(
+                other: k3[i].re().sat_add(other: k3[i].re()).sat_add(other: k4[i].re()),
+            )
+            .raw()
+        let si: i32 = k1[i]
+            .im()
+            .sat_add(other: k2[i].im().sat_add(other: k2[i].im()))
+            .sat_add(
+                other: k3[i].im().sat_add(other: k3[i].im()).sat_add(other: k4[i].im()),
+            )
+            .raw()
+        out[i] = Cplx::new(
+            re: w[i].re().sat_add(other: Q15::from_raw(raw: mul_dt_sixth(x: sr))),
+            im: w[i].im().sat_add(other: Q15::from_raw(raw: mul_dt_sixth(x: si))),
+        )
+        i += 1
+    }
+    out
+}
+
+/// Per-step diagnostics, as Q15 raws.
+pub struct Diag { energy_raw: i32, wmax_raw: i32 }
+
+/// Diagnostics from physical u, v, w (real parts of the inverse
+/// transforms of u_hat, v_hat, w_hat). Energy = 0.5*mean(u^2+v^2):
+/// `sat_mul` squares accumulated in i64 with saturation, round-half-up
+/// mean over the 2*1024 squared terms — that mean IS the energy (the
+/// 0.5 is the division by 2*nn, no extra half). Mirrors the oracle's
+/// `FixedSolver.diagnostics` exactly.
+pub fn diagnostics(w_hat: [Cplx; 1024]) -> Diag {
+    // Velocity spectral fields: psi_hat = w_hat / K2,
+    // u_hat = i*ky*psi_hat, v_hat = -i*kx*psi_hat.
+    // (Duplicated from `rhs`; see the note there.)
+    var u_hat: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var v_hat: [Cplx; 1024] = [Cplx::zero(); 1024]
+    var r: usize = 0
+    while r < 32 {
+        let ky: i32 = K[r]
+        let ky_q: Q15 = Q15::from_raw(raw: ky << 15)
+        var c: usize = 0
+        while c < 32 {
+            let kx: i32 = K[c]
+            let kx_q: Q15 = Q15::from_raw(raw: kx << 15)
+            let idx: usize = r * 32 + c
+            let k2: i32 = kx * kx + ky * ky
+            let psi: Cplx = cplx_mul_real(a: w_hat[idx], s: Q15::from_raw(raw: inv_k2(k2: k2)))
+            u_hat[idx] = cplx_mul_i(a: psi, k: ky_q)
+            v_hat[idx] = cplx_mul_neg_i(a: psi, k: kx_q)
+            c += 1
+        }
+        r += 1
+    }
+    let u_full: [Cplx; 1024] = ifft2_32(x: u_hat)
+    let v_full: [Cplx; 1024] = ifft2_32(x: v_hat)
+    let w_full: [Cplx; 1024] = ifft2_32(x: w_hat)
+    var acc: i64 = 0
+    var wmax: i32 = 0
+    var i: usize = 0
+    while i < 1024 {
+        acc = acc.saturating_add(u_full[i].re().sat_mul(other: u_full[i].re()).raw() as i64)
+        acc = acc.saturating_add(v_full[i].re().sat_mul(other: v_full[i].re()).raw() as i64)
+        let a: i32 = w_full[i].re().abs().raw()
+        if a > wmax { wmax = a }
+        i += 1
+    }
+    // Round-half-up mean over 2*1024 terms (acc >= 0: sum of squares).
+    let m: i64 = 2048
+    let q: i64 = acc / m
+    let rem: i64 = acc % m
+    let rounded: i64 = if rem >= (m + 1) / 2 { q + 1 } else { q }
+    Diag { energy_raw: rounded.downcast_saturate(), wmax_raw: wmax }
+}
+
+/// One trapezoidal BKM update: `bkm += dt/2 * (w_prev + wmax)`.
+/// Mirrors the oracle's `FixedSolver.run` BKM step.
+fn bkm_update(bkm: i32, w_prev: i32, wmax: i32) -> i32 {
+    let s: i32 = Q15::from_raw(raw: w_prev).sat_add(other: Q15::from_raw(raw: wmax)).raw()
+    Q15::from_raw(raw: bkm).sat_add(other: Q15::from_raw(raw: mul_dt_half(x: s))).raw()
+}
+
+/// Final diagnostics of a run: the last energy / wmax and the BKM
+/// integral (trapezoidal, dt/2 per step). Scalars only — an earlier
+/// version also returned the final spectrum, and the sonatina
+/// backend's codegen for that [Cplx; 1024] struct return was
+/// pathologically slow; callers that need the spectrum keep it from
+/// their own loop (see the tests below).
+pub struct RunScalars { energy_raw: i32, wmax_raw: i32, bkm_raw: i32 }
+
+/// Run `steps` RK4 steps from `w0`, returning the final state.
+/// Diagnostics are taken at t = 0 and after every step; BKM is the
+/// trapezoid over the wmax sequence. Mirrors the oracle's
+/// `FixedSolver.run`.
+pub fn run(w0: [Cplx; 1024], steps: usize) -> RunScalars {
+    var w: [Cplx; 1024] = w0
+    var bkm: i32 = 0
+    var d: Diag = diagnostics(w_hat: w)
+    var w_prev: i32 = d.wmax_raw
+    var s: usize = 0
+    while s < steps {
+        w = rk4_step(w: w)
+        d = diagnostics(w_hat: w)
+        bkm = bkm_update(bkm: bkm, w_prev: w_prev, wmax: d.wmax_raw)
+        w_prev = d.wmax_raw
+        s += 1
+    }
+    RunScalars { energy_raw: d.energy_raw, wmax_raw: d.wmax_raw, bkm_raw: bkm }
+}
+
+/// Initial Taylor-Green spectrum, N = 32: w = 2*sin(x)*sin(y).
+/// Analytic modes only (float DFT of the analytic field on the grid,
+/// rounded to Q15 raws — the oracle's `init_spectrum`): 4 modes at
+/// (kx, ky) = (+1,+1), (-1,+1), (+1,-1), (-1,-1), raws -/+16777216
+/// (= -/+512 * 32768). Every other mode rounds to exactly 0.
+pub fn init_tg() -> [Cplx; 1024] {
+    var w: [Cplx; 1024] = [Cplx::zero(); 1024]
+    w[33] = Cplx::new(re: Q15::from_raw(raw: -16777216), im: Q15::zero())
+    w[63] = Cplx::new(re: Q15::from_raw(raw: 16777216), im: Q15::zero())
+    w[993] = Cplx::new(re: Q15::from_raw(raw: 16777216), im: Q15::zero())
+    w[1023] = Cplx::new(re: Q15::from_raw(raw: -16777216), im: Q15::zero())
+    w
+}
+
+/// Initial perturbed spectrum, N = 32: w = 2*sin(x)*sin(y)
+/// + 0.5*sin(2x)*cos(3y) + 0.3*cos(3x)*sin(y) - 0.2*sin(x)*cos(2y).
+/// 16 analytic modes (oracle's `init_spectrum`, field "perturbed").
+pub fn init_perturbed() -> [Cplx; 1024] {
+    var w: [Cplx; 1024] = [Cplx::zero(); 1024]
+    w[33] = Cplx::new(re: Q15::from_raw(raw: -16777216), im: Q15::zero())
+    w[35] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: -2516582))
+    w[61] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: -2516582))
+    w[63] = Cplx::new(re: Q15::from_raw(raw: 16777216), im: Q15::zero())
+    w[65] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: 1677722))
+    w[95] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: -1677722))
+    w[98] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: -4194304))
+    w[126] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: 4194304))
+    w[930] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: -4194304))
+    w[958] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: 4194304))
+    w[961] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: 1677722))
+    w[991] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: -1677722))
+    w[993] = Cplx::new(re: Q15::from_raw(raw: 16777216), im: Q15::zero())
+    w[995] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: 2516582))
+    w[1021] = Cplx::new(re: Q15::zero(), im: Q15::from_raw(raw: 2516582))
+    w[1023] = Cplx::new(re: Q15::from_raw(raw: -16777216), im: Q15::zero())
+    w
+}
+
+#[test]
+fn probe_fft2_roundtrip() {
+    // A single impulse at (0, 0): fft2 is flat (every bin 1.0), and
+    // ifft2 brings it back exactly.
+    var x: [Cplx; 1024] = [Cplx::zero(); 1024]
+    x[0] = Cplx::from_re(re: Q15::one())
+    let f = fft2_32(x: x)
+    assert!(f[0].re().raw() == 32768)
+    assert!(f[0].im().raw() == 0)
+    assert!(f[1023].re().raw() == 32768)
+    assert!(f[1023].im().raw() == 0)
+    assert!(f[511].re().raw() == 32768)
+    let back = ifft2_32(x: f)
+    assert!(back[0].re().raw() == 32768)
+    assert!(back[0].im().raw() == 0)
+    assert!(back[1].re().raw() == 0)
+    assert!(back[1023].re().raw() == 0)
+}
+
+/// Oracle 10-step Taylor-Green trajectory (N = 32, dt = 0.004),
+/// from `tools/fluid_oracle.json` (`tg_n32_10steps`, fixed-point
+/// solver): (energy_raw, wmax_raw, bkm_raw) at steps 0..10.
+/// Energy is monotone decreasing; BKM is the trapezoid over wmax.
+const TG_E: [i32; 11] = [8192, 8191, 8189, 8188, 8187, 8185, 8184, 8183, 8181, 8180, 8179]
+const TG_W: [i32; 11] = [
+    65536,
+    65531,
+    65526,
+    65520,
+    65515,
+    65510,
+    65505,
+    65499,
+    65494,
+    65489,
+    65484,
+]
+const TG_B: [i32; 11] = [0, 262, 524, 786, 1048, 1310, 1572, 1834, 2096, 2358, 2620]
+
+#[test]
+fn tg_10_steps_exact() {
+    // Fe must reproduce the oracle's fixed-point trajectory EXACTLY
+    // (every raw, every step) — not within a tolerance. Any
+    // difference means the Fe code and the oracle diverge.
+    var w: [Cplx; 1024] = init_tg()
+    var d: Diag = diagnostics(w_hat: w)
+    assert!(d.energy_raw == TG_E[0])
+    assert!(d.wmax_raw == TG_W[0])
+    var bkm: i32 = 0
+    var w_prev: i32 = d.wmax_raw
+    var prev_e: i32 = d.energy_raw
+    var s: usize = 0
+    while s < 10 {
+        w = rk4_step(w: w)
+        d = diagnostics(w_hat: w)
+        assert!(d.energy_raw == TG_E[s + 1])
+        assert!(d.wmax_raw == TG_W[s + 1])
+        // Energy is monotone decreasing (pure diffusion eigenmode).
+        assert!(d.energy_raw <= prev_e)
+        prev_e = d.energy_raw
+        bkm = bkm_update(bkm: bkm, w_prev: w_prev, wmax: d.wmax_raw)
+        assert!(bkm == TG_B[s + 1])
+        w_prev = d.wmax_raw
+        s += 1
+    }
+    // `run` must agree with the manual loop on the final state.
+    let r: RunScalars = run(w0: init_tg(), steps: 10)
+    assert!(r.energy_raw == TG_E[10])
+    assert!(r.wmax_raw == TG_W[10])
+    assert!(r.bkm_raw == TG_B[10])
+}
+
+#[test]
+fn tg_1_step() {
+    // Minimal solver check: diagnostics at t = 0, one RK4 step,
+    // diagnostics at step 1. Exists so a single-step run can be
+    // timed in isolation (`fe test -f tg_1_step`) — it separates
+    // sonatina compile time from 10-step execution time.
+    var w: [Cplx; 1024] = init_tg()
+    var d: Diag = diagnostics(w_hat: w)
+    assert!(d.energy_raw == TG_E[0])
+    assert!(d.wmax_raw == TG_W[0])
+    w = rk4_step(w: w)
+    d = diagnostics(w_hat: w)
+    assert!(d.energy_raw == TG_E[1])
+    assert!(d.wmax_raw == TG_W[1])
+}
+
+/// Oracle 10-step perturbed trajectory (N = 32, dt = 0.004),
+/// from the oracle's fixed-point solver (`FixedSolver(32,
+/// "perturbed").run(10)`): (energy_raw, wmax_raw, bkm_raw) at steps
+/// 0..10. Energy is monotone decreasing; wmax is NOT (the nonlinear
+/// term moves it up and down by a few raw units), so only energy
+/// monotonicity is asserted here.
+const PB_E: [i32; 11] = [8340, 8339, 8337, 8336, 8335, 8333, 8332, 8330, 8329, 8327, 8326]
+const PB_W: [i32; 11] = [
+    80321,
+    80324,
+    80326,
+    80327,
+    80328,
+    80329,
+    80330,
+    80329,
+    80329,
+    80328,
+    80326,
+]
+const PB_B: [i32; 11] = [0, 321, 642, 963, 1284, 1605, 1926, 2247, 2568, 2889, 3210]
+
+#[test]
+fn perturbed_10_steps_exact() {
+    // The honest test: the perturbed field has a live nonlinear term
+    // ((u.grad)w != 0), so this exercises the physical-space product,
+    // the fft2 round trip, and the de-aliasing mask — not just
+    // diffusion. Fe must reproduce the oracle EXACTLY, every raw.
+    var w: [Cplx; 1024] = init_perturbed()
+    var d: Diag = diagnostics(w_hat: w)
+    assert!(d.energy_raw == PB_E[0])
+    assert!(d.wmax_raw == PB_W[0])
+    var bkm: i32 = 0
+    var w_prev: i32 = d.wmax_raw
+    var prev_e: i32 = d.energy_raw
+    var s: usize = 0
+    while s < 10 {
+        w = rk4_step(w: w)
+        d = diagnostics(w_hat: w)
+        assert!(d.energy_raw == PB_E[s + 1])
+        assert!(d.wmax_raw == PB_W[s + 1])
+        // Energy is monotone decreasing (viscous decay dominates).
+        assert!(d.energy_raw <= prev_e)
+        prev_e = d.energy_raw
+        bkm = bkm_update(bkm: bkm, w_prev: w_prev, wmax: d.wmax_raw)
+        assert!(bkm == PB_B[s + 1])
+        w_prev = d.wmax_raw
+        s += 1
+    }
+    // `run` must agree with the manual loop on the final state.
+    let r: RunScalars = run(w0: init_perturbed(), steps: 10)
+    assert!(r.energy_raw == PB_E[10])
+    assert!(r.wmax_raw == PB_W[10])
+    assert!(r.bkm_raw == PB_B[10])
+}
+
+/// Oracle 250-step finals (N = 32, dt = 0.004, t = 1.0), from the
+/// oracle's fixed-point solver (`FixedSolver(32, field).run(250)`):
+/// TG (energy_raw, wmax_raw, bkm_raw) = (7871, 64240, 64851);
+/// perturbed = (7992, 76676, 78507). Energy is monotone decreasing
+/// over all 250 steps in both cases (oracle `mono: True`). These are
+/// long-horizon exact checks: any divergence from the oracle at any
+/// intermediate step changes the final raws. Each takes ~2 min on
+/// the native backend (250 RK4 steps); they are the slowest tests in
+/// the suite by design, and the reason the fluid ingot's native run
+/// takes minutes, not seconds.
+#[test]
+fn tg_250_steps_exact() {
+    let r: RunScalars = run(w0: init_tg(), steps: 250)
+    assert!(r.energy_raw == 7871)
+    assert!(r.wmax_raw == 64240)
+    assert!(r.bkm_raw == 64851)
+}
+
+#[test]
+fn perturbed_250_steps_exact() {
+    let r: RunScalars = run(w0: init_perturbed(), steps: 250)
+    assert!(r.energy_raw == 7992)
+    assert!(r.wmax_raw == 76676)
+    assert!(r.bkm_raw == 78507)
+}
