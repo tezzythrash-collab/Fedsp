@@ -1,0 +1,7 @@
+# Ingot config
+[ingot]
+name = "fluid"
+version = "0.4.1"
+
+[dependencies]
+fedsp = "../fedsp"
