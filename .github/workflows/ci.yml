@@ -27,14 +27,20 @@ jobs:
       - name: Format check (demo contract)
         run: fe fmt --check ingots/demo
 
+      - name: Format check (fluid demo)
+        run: fe fmt --check ingots/fluid
+
       - name: Type check (workspace)
         run: fe check
 
-      - name: Test (sonatina backend, both members)
-        run: fe test
+      - name: Test (sonatina backend, library + demo)
+        run: fe test ingots/fedsp ingots/demo
 
       - name: Test (native backend, library only)
         run: fe test --backend native ingots/fedsp
+
+      - name: Test (native backend, fluid demo)
+        run: fe test --backend native --native-timeout-secs 600 ingots/fluid
 
       - name: Build (DspDemo contract)
         run: fe build
@@ -47,3 +53,19 @@ jobs:
 # member: the library suite stays green on both backends, and the
 # contract test runs on sonatina. `fe build` compiles the contract to
 # out/DspDemo.{bin,runtime.bin} + out/DspDemo.abi.json.
+#
+# NOTE: the fluid demo ingot (ingots/fluid, Step 4 of the Clay
+# mapping) is native-only in CI, and the sonatina step above is scoped
+# to fedsp + demo for the same isolation reason. Fe 26.5.0's sonatina
+# backend codegen for the fluid solver's [Cplx; 1024] value semantics
+# is pathologically slow: the probe-only ingot compiled in ~4 min, but
+# the full solver ingot ran 30+ min twice with no output (and ~2.5 GB
+# RSS) and never finished in this environment, so it cannot
+# practically run on sonatina here — and the 250-step tests would
+# additionally need hours of EVM execution. The solver is verified
+# natively instead, exactly: the Fe trajectory reproduces the Python
+# oracle's fixed-point trajectory bit-for-bit over 10 and 250 steps
+# (see ingots/fluid/src/lib.fe). The 250-step tests take ~85 s each
+# natively, over the 60 s default `--native-timeout-secs`, hence the
+# 600 s flag on the fluid step. The 2D FFT core itself (probe) DID
+# pass on sonatina when the ingot was probe-only.
