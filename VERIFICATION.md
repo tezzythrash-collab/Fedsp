@@ -1,4 +1,125 @@
-# Verification — FeDSP v0.4.0 (2026-11-20)
+# Verification — FeDSP v0.4.1 + Clay steps 1+4 (2026-11-23)
+
+## Steps 1+4 verification (2026-11-23, this VM, `fe 26.5.0 (3dab95f)`)
+
+Clay-mapping steps 1 (Taylor-Green FFT oracle test) and 4 (fixed-point
+spectral fluid demo) verified on the working tree, then committed. All
+commands run in `~/workspace/fedsp/`:
+
+- `fe fmt --check ingots/fedsp ingots/demo ingots/fluid` → clean.
+- `fe check` (workspace root) → clean.
+- `fe test ingots/fedsp ingots/demo` (sonatina) → **34 passed, 0 failed**
+  (33 library + 1 demo contract), including the new
+  `fft_taylor_green_slice` oracle test.
+- `fe test --backend native ingots/fedsp` → **33 passed, 0 failed**.
+- `fe test --backend native --native-timeout-secs 600 ingots/fluid` →
+  **6 passed, 0 failed**: `probe_fft2_roundtrip`, `tg_1_step`,
+  `perturbed_10_steps_exact`, `tg_10_steps_exact`,
+  `tg_250_steps_exact` (53.0 s), `perturbed_250_steps_exact` (53.1 s).
+  The `_exact` tests assert the Fe trajectory reproduces the Python
+  fixed-point oracle (`tools/fluid_oracle.py`) bit-for-bit over 10 and
+  250 steps, Taylor-Green and perturbed.
+- `fe build` (workspace root) → succeeds, writes the three DspDemo
+  artifacts (`out/DspDemo.bin` 12,940 B, `out/DspDemo.runtime.bin`
+  12,900 B, `out/DspDemo.abi.json` 1,201 B).
+
+### Sonatina limitation (unchanged, stated for the judges)
+
+The fluid solver is **native-only**: Fe 26.5.0's sonatina codegen for
+the `[Cplx; 1024]` value semantics is pathologically slow — the full
+solver ingot ran 30+ min twice with no output (~2.5 GB RSS) and never
+finished in this environment, so it cannot practically run on sonatina
+here, and the 250-step tests would additionally need hours of EVM
+execution. CI scopes the sonatina step to fedsp + demo and runs fluid
+natively with a 600 s timeout. The 2D FFT core itself (probe) DID pass
+on sonatina when the ingot was probe-only. This is a toolchain
+limitation, not a library defect: the solver is verified exactly
+(bit-for-bit vs the oracle) on the native backend.
+
+### Status
+
+**VERIFIED** (library both backends; demo contract sonatina; fluid
+native-exact). **NOT pushed, NOT re-submitted.** The FE-089 form still
+points at the v0.4.0 head commit `0943c14a23776554115d60d08a6d2b98ab902a48`;
+re-submission of the new head before Nov 24, 2026, 23:59 UTC is a
+separate founder step. The local repo has no remote configured; the
+GitHub repo is `tezzythrash-collab/Fedsp` (user-created Nov 19).
+
+# Verification — FeDSP v0.4.1 (2026-11-21)
+
+## v0.4.1 pre-submission audit (2026-11-21)
+
+Independent audit of the submitted v0.4.0 code (GitHub head `0943c14`,
+verified byte-identical to the local working copy at `348f8f2` by blob
+SHA on every tracked file: `lib.fe`, `tests.fe`, `README.md`,
+`VERIFICATION.md`, `ci.yml`). Three errors found and fixed, one verified
+improvement applied. Full record: the audit report at
+`~/workspace/goals/fe-builders/files/fedsp-v0.4.0-audit-report-2026-11-21.md`.
+
+### Errors found and fixed
+
+1. **`from_ratio` rounded toward zero for negative denominators.**
+   The rounding adjustment keyed on whether numerator and denominator
+   agreed in sign; for every negative denominator it rounded toward
+   zero instead of to nearest (ties away from zero) — up to 1 ulp
+   wrong, e.g. `from_ratio(11, -4)` returned `-2` instead of `-3`.
+   The oracle mirrored the same formula, so the suite could not catch
+   it, and all existing vectors used non-negative denominators. Fixed
+   in both the library and the oracle (adjustment now follows the sign
+   of the numerator); the corrected formula was swept against exact
+   rational arithmetic on 20,000 random cases (0 mismatches) and pinned
+   with 5 new negative-denominator asserts.
+2. **Reciprocal accuracy: Newton was not ~1-2 ulp.** The 5-step Newton
+   iteration was ~1 ulp of the *normalized* reciprocal, but the final
+   rescale by `2^k` amplified that to as much as `2^k` ulp — 16384 ulp
+   for Q15 `raw == 1` (12 of 60 tested cases off by more than 2 ulp,
+   worst 16384) — while the docs claimed ~1–2 ulp. Replaced with a
+   single `i64` division (`2^(2*FRAC) / raw`, exact because
+   `2^(2*FRAC) <= 2^62` fits in `i64`), exactly rounded (0 ulp) on all
+   13,568 swept `(FRAC, raw)` pairs across FRAC 0..31. 8 fixed-vector
+   and 9 differential reciprocal values changed to the exact values;
+   9 new cross-format asserts (Q7, Q<5>, Q<10>, Q<30>).
+3. **Empty frames and filters trapped.** `mean`, `rms`, and `Fir::step`
+   trapped (division by zero / empty delay-line index) on zero-length
+   inputs, breaking the library's "never reverts" rule — confirmed by
+   probe on both backends (SIGILL). They now return zero by convention,
+   like `dot` and `energy` already did. New `empty_frames` test.
+
+### Independent checks (beyond the suite)
+
+- Oracle regeneration: all four oracle outputs byte-identical except
+  the reciprocal values above and 5 added `from_ratio` entries.
+- Differential-test transcription: all 1361 integer values identical
+  to the generator output (differences were `fe fmt` reformatting only).
+- Exact-truth sweep: 70 scalar cases (sat_mul, sat_div, from_ratio
+  den>0, convert_q, dot) recomputed from exact rational arithmetic —
+  0 failures. Biquad/FIR cross-checked against float TDF-II/dot (max
+  1 ulp / 0 ulp). FFT mirror-vs-float-DFT max 11 ulp at 64 points
+  (bound 16); round-trips within 1 ulp.
+- Butterworth `lowpass_01` coefficients verified against the RBJ
+  formulas (fc = 0.1 fs): [2210, 4421, 2210, -37453, 13527].
+- Reciprocal exactness and the from_ratio fix each swept against exact
+  rational arithmetic (13,568 and 20,000 cases, 0 mismatches).
+
+### What was run (this VM, `fe 26.5.0 (3dab95f)`, in `~/workspace/fedsp/`)
+
+- `fe fmt --check ingots/fedsp` → clean. `fe fmt --check ingots/demo` → clean.
+- `fe check` (workspace root) → clean.
+- `fe test` (sonatina, both members) → **33 passed, 0 failed**, exit 0.
+- `fe test --backend native ingots/fedsp` → **32 passed, 0 failed**, exit 0.
+- `fe build` (workspace root) → succeeds, writes the three DspDemo artifacts
+  (`out/DspDemo.bin` 12,940 B, `out/DspDemo.runtime.bin` 12,900 B,
+  `out/DspDemo.abi.json` 1,201 B).
+- Total: 33 test fns, 410 `assert!` sites (library 397, demo contract 13).
+- Status: **VERIFIED** (library both backends; demo contract sonatina).
+  **NOT pushed, NOT re-submitted.** The FE-089 form still points at the
+  v0.4.0 head commit `0943c14a23776554115d60d08a6d2b98ab902a48`;
+  re-submission of the v0.4.1 head before Nov 24, 2026, 23:59 UTC is a
+  separate founder step.
+- Code commit: `356a2d8` (this VERIFICATION.md committed separately as
+  the head; the two commits differ only in this file).
+
+## Verification — FeDSP v0.4.0 (2026-11-20)
 
 ## What changed
 
@@ -187,7 +308,7 @@ Complexity (per operation, from the implementation in
 | `sat_add` / `sat_sub` / `sat_mul` / `sat_div` | O(1) | one i64 widen + round + clamp |
 | `convert_q` | O(1) | one shift + rounding add |
 | `Q::sqrt` | O(log bits) Newton steps | `isqrt_round`: Newton from `x/2 + 1`, converges while the next iterate is smaller; bounded by ~31 iterations for i64 |
-| `Q::reciprocal` | O(1), 5 fixed Newton steps | plus a normalization loop of at most 31 shifts |
+| `Q::reciprocal` | O(1), one i64 division | exactly rounded (v0.4.1); was 5 fixed Newton steps + a normalization loop of at most 31 shifts |
 | `dot<const N>` | O(N) | N `sat_mul` + N saturating i64 adds + 1 rounding add |
 | `window` | O(N) | N `sat_mul` |
 | `mean` / `energy` | O(N) | N saturating i64 adds; `energy` is `dot(x, x)` |
