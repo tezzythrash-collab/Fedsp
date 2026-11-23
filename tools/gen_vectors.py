@@ -14,6 +14,8 @@ Semantics mirrored exactly from src/lib.fe (documented there too):
   - from_int / from_i64: saturating, via i64 range check before shifting.
   - from_ratio(num, den): (num << FRAC) / den with round-to-nearest
     (ties away from zero), den == 0 -> MAX/MIN/0 by sign of num.
+    The rounding adjustment follows the sign of the numerator, so
+    negative denominators round correctly (v0.4.1 audit fix).
   - Hann window: round(0.5 * (1 - cos(2*pi*n/(N-1))) * 32767), Q15 raw.
   - dot (v0.2.0): i64 accumulation with saturation at every step
     (clamp_i64 after each add), then round-to-nearest and clamp to i32.
@@ -26,9 +28,11 @@ Semantics mirrored exactly from src/lib.fe (documented there too):
     (ties toward +inf). rms: saturating sum of squares, integer sqrt
     of the mean, rounded to nearest. energy: dot(x, x).
   - q_sqrt: isqrt(raw << FRAC), rounded to nearest; negative -> 0.
-  - q_reciprocal: Newton iteration (5 fixed steps) on the normalized
-    mantissa, mirroring Q::reciprocal step for step, with the same
-    saturation branches for 0, Q<0>, and Q<31>.
+  - q_reciprocal: exactly rounded 1/x by one i64 division
+    (2**(2*FRAC) / raw, ties toward +inf), saturating; 0 ulp on
+    every input (v0.4.1: replaced the 5-step Newton iteration, which
+    was ~1 ulp of the normalized reciprocal but up to 2**k ulp
+    after rescaling).
   - differential (v0.4.0): seeded random inputs (seed 20261120,
     consumed in the fixed order dot -> fir -> biquad -> fft -> scalars
     -> demo-contract frame) through dot, FIR, biquad, FFT, sqrt,
@@ -122,40 +126,25 @@ def q_sqrt(raw, frac):
 
 
 def q_reciprocal(raw, frac):
-    """Q<FRAC> reciprocal, raw in -> raw out, by Newton iteration.
-    Mirrors Q::reciprocal in src/lib.fe step for step, including the
-    5 fixed iterations, the normalization, and the saturation branches."""
+    """Q<FRAC> reciprocal, raw in -> raw out, exactly rounded to
+    nearest (ties toward +inf), saturating. One i64 division:
+    1/x in Q<FRAC> has raw 2^(2*FRAC) / raw. Mirrors Q::reciprocal
+    in src/lib.fe exactly (v0.4.1: the old 5-step Newton mirror is
+    gone — it was ~1 ulp of the normalized reciprocal but up to
+    2^k ulp after rescaling)."""
     if raw == 0:
         return I32_MAX
     if frac == 0:
         return raw if raw in (1, -1) else 0
     if frac >= 31:
         return I32_MIN if raw < 0 else I32_MAX
-    # Normalize |raw| into [2**(frac-1), 2**frac) by shifting.
-    m = abs(raw)
-    k = 0
-    lo = 1 << (frac - 1)
-    hi = 1 << frac
-    while m < lo:
-        m <<= 1
-        k += 1
-    while m >= hi:
-        m >>= 1
-        k -= 1
-    one = 1 << frac
-    y = from_ratio(3, 2, frac)  # 1.5, exact
-    for _ in range(5):
-        prod = sat_mul(m, y, frac)          # x' * y
-        one_minus = sat_sub_i32(one, prod)  # 1 - x' * y
-        y = sat_add_i32(y, sat_mul(y, one_minus, frac))
-    if k >= 0:
-        y_raw = clamp_i32(y << k)
-    else:
-        d = -k
-        y_raw = clamp_i32((y + (1 << (d - 1))) >> d)
-    if raw < 0:
-        y_raw = I32_MAX if y_raw == I32_MIN else -y_raw  # sat_neg
-    return y_raw
+    num = 1 << (2 * frac)
+    den = raw
+    if den > 0:
+        return clamp_i32(trunc_div(num + den // 2, den))
+    m = -den
+    q, r = num // m, num % m
+    return clamp_i32(-(q + 1) if 2 * r > m else -q)
 
 
 def from_int(x, frac):
@@ -172,12 +161,15 @@ def from_ratio(num, den, frac):
     if den == 0:
         return I32_MAX if num > 0 else (I32_MIN if num < 0 else 0)
     v = num << frac
-    # round to nearest, ties away from zero
+    # round to nearest, ties away from zero. The adjustment follows
+    # the sign of the *numerator* (v0.4.1 audit fix: the old branch
+    # keyed on whether v and den agreed in sign, which rounded
+    # toward zero for every negative denominator).
     half = abs(den) // 2
     if v >= 0:
-        return clamp_i32(trunc_div(v + half, den)) if den > 0 else clamp_i32(trunc_div(v - half, den))
+        return clamp_i32(trunc_div(v + half, den))
     else:
-        return clamp_i32(trunc_div(v - half, den)) if den > 0 else clamp_i32(trunc_div(v + half, den))
+        return clamp_i32(trunc_div(v - half, den))
 
 
 def hann(n_points):
@@ -431,6 +423,13 @@ def main():
         "q15_1_0": from_ratio(1, 0, 15),          # div by zero -> MAX
         "q15_neg1_0": from_ratio(-1, 0, 15),      # -> MIN
         "q15_0_0": from_ratio(0, 0, 15),          # -> 0
+        # Negative denominators (v0.4.1 audit: the old formula rounded
+        # toward zero here instead of to nearest, ties away from zero).
+        "q15_11_neg4": from_ratio(11, -4, 15),    # -2.75 -> -90112
+        "q15_neg11_neg4": from_ratio(-11, -4, 15),  # 2.75 -> 90112
+        "q15_10_neg4": from_ratio(10, -4, 15),    # -2.5, tie -> -81920
+        "q15_neg20_neg7": from_ratio(-20, -7, 15),  # 2.857.. -> 93623
+        "q15_1_neg3": from_ratio(1, -3, 15),      # -0.333.. -> -10923
     }
 
     # --- saturating add/sub ----------------------------------------------
@@ -757,6 +756,58 @@ def main():
     print("fft round-trip max err:",
           max(v["fft"][k]["roundtrip_err"] for k in v["fft"]))
     print("fft parseval diffs:", parseval_diffs)
+
+    # --- Taylor-Green slice (Rank 1, Clay mapping) -------------------
+    # 1D slice of the Taylor-Green vorticity field w = 2 sin x sin y at
+    # sin y = 1: x[n] = 2 sin(2*pi*n/N), amplitude exactly 2.0 in Q15.
+    # Its DFT has exactly two non-zero bins: bin 1 = -i*N, bin N-1 =
+    # +i*N (Q15 values), i.e. im raws -/+ N*32768. Every other bin is
+    # zero in exact arithmetic; the mirrored FFT reports the small
+    # residuals from input/twiddle quantization. Cross-check bounds
+    # are looser than the fixed FFT vectors (16 / 2 ulp) because the
+    # error scales with input amplitude (2.0 here vs <= 1.0 there) and
+    # with N: observed mirror-vs-DFT 3/9/27 and round-trip 2/2/3 at
+    # N = 16/32/64, i.e. ~1e-5 relative on the peak bin at N=64.
+    # Bounds below (32 / 4 ulp) carry headroom over those observations.
+    v["taylor_green"] = {}
+    for n in (16, 32, 64):
+        xs = [(int(round(2.0 * math.sin(2.0 * math.pi * t / n) * 32768)), 0)
+              for t in range(n)]
+        tw_re, tw_im = fft_tw[n]
+        rev = fft_rev[n]
+        m = fft_mirror(xs, tw_re, tw_im, rev)
+        d = dft_float(xs)
+        err = max(max(abs(mr - dr), abs(mi - di))
+                  for (mr, mi), (dr, di) in zip(m, d))
+        assert err <= 32, f"taylor-green n={n}: mirror vs float DFT err {err} > 32"
+        rt = ifft_mirror(m, tw_re, tw_im, rev)
+        rt_err = max(max(abs(a - c), abs(b - dd))
+                     for (a, b), (c, dd) in zip(rt, xs))
+        assert rt_err <= 4, f"taylor-green n={n}: round-trip err {rt_err} > 4"
+        peak = n * 32768
+        assert abs(m[1][0]) <= 32 and abs(m[1][1] + peak) <= 32, \
+            f"taylor-green n={n}: bin 1 = {m[1]}, expected (0, {-peak})"
+        assert abs(m[n - 1][0]) <= 32 and abs(m[n - 1][1] - peak) <= 32, \
+            f"taylor-green n={n}: bin {n - 1} = {m[n - 1]}, expected (0, {peak})"
+        other_max = max(max(abs(m[k][0]), abs(m[k][1]))
+                        for k in range(n) if k not in (1, n - 1))
+        assert other_max <= 32, f"taylor-green n={n}: non-peak bin {other_max} > 32"
+        v["taylor_green"][f"n{n}"] = {
+            "input": [re for re, _ in xs],
+            "out_re": [re for re, _ in m],
+            "out_im": [im for _, im in m],
+            "magnitude": [cplx_magnitude(re, im) for re, im in m],
+            "roundtrip": [re for re, _ in rt],
+            "roundtrip_im": [im for _, im in rt],
+            "roundtrip_err": rt_err,
+            "dft_err": err,
+            "peak_raw": peak,
+            "other_max": other_max,
+        }
+    print("taylor-green:", {k: (v["taylor_green"][k]["dft_err"],
+                                v["taylor_green"][k]["roundtrip_err"],
+                                v["taylor_green"][k]["other_max"])
+                           for k in v["taylor_green"]})
 
     # --- Cplx unit values (v0.3.0) ---------------------------------------------
     half_c = (16384, 16384)  # 0.5 + 0.5i
