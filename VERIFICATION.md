@@ -39,11 +39,12 @@ limitation, not a library defect: the solver is verified exactly
 ### Status
 
 **VERIFIED** (library both backends; demo contract sonatina; fluid
-native-exact). **NOT pushed, NOT re-submitted.** The FE-089 form still
-points at the v0.4.0 head commit `0943c14a23776554115d60d08a6d2b98ab902a48`;
-re-submission of the new head before Nov 24, 2026, 23:59 UTC is a
-separate founder step. The local repo has no remote configured; the
-GitHub repo is `tezzythrash-collab/Fedsp` (user-created Nov 19).
+native-exact). **PUSHED Nov 23, 2026; FE-089 re-filed and ACCEPTED Nov 23,
+2026, 10:29 AM MST at commit `d9bcaa862f9ea22837ec33748b7c7a2fcd09044d`**
+(v0.4.1 + Clay steps 1+4; local head `265fa87`). The Nov 24, 2026,
+23:59 UTC corrections deadline is moot for the accepted filing. The local
+repo has no remote configured; the GitHub repo is
+`tezzythrash-collab/Fedsp` (user-created Nov 19).
 
 # Verification — FeDSP v0.4.1 (2026-11-21)
 
@@ -112,10 +113,10 @@ improvement applied. Full record: the audit report at
   `out/DspDemo.abi.json` 1,201 B).
 - Total: 33 test fns, 410 `assert!` sites (library 397, demo contract 13).
 - Status: **VERIFIED** (library both backends; demo contract sonatina).
-  **NOT pushed, NOT re-submitted.** The FE-089 form still points at the
-  v0.4.0 head commit `0943c14a23776554115d60d08a6d2b98ab902a48`;
-  re-submission of the v0.4.1 head before Nov 24, 2026, 23:59 UTC is a
-  separate founder step.
+  **PUSHED Nov 23, 2026; FE-089 re-filed and ACCEPTED Nov 23, 2026,
+  10:29 AM MST at commit `d9bcaa862f9ea22837ec33748b7c7a2fcd09044d`.**
+  The v0.4.1 head is the accepted filing; the Nov 24 corrections
+  deadline is moot for it.
 - Code commit: `356a2d8` (this VERIFICATION.md committed separately as
   the head; the two commits differ only in this file).
 
@@ -212,10 +213,10 @@ of Fe 26.5.0, not a property of the library or the contract.
   above |X| = 256 (never triggers for real audio inputs at these sizes);
   no resampling yet; gas use unmeasured (see Benchmarks).
 - Status: **VERIFIED** (library both backends; demo contract sonatina).
-  **NOT pushed, NOT re-submitted.** The FE-089 form still points at the
-  v0.1.0 head commit `0a0159006392f1e14cd4351fa12653c57d63c817`;
-  re-submission before Nov 24, 2026, 23:59 UTC is a separate founder step
-  if v0.4.0 is to be judged.
+  **NOT pushed, NOT re-submitted** (as of this version's verification,
+  Nov 20, 2026). **Update 2026-11-23:** superseded — v0.4.1 was pushed
+  and FE-089 was re-filed and accepted at commit `d9bcaa86`; this line
+  records the state at this version's verification date.
 - Post-verification fix (independent review): README.md "Verified, not
   asserted" cited the pre-workspace path `src/tests.fe`; corrected to
   `ingots/fedsp/src/tests.fe`. Docs-only change; `fe test` re-run after
@@ -341,8 +342,11 @@ Complexity (per operation, from the implementation in
 - `src/tests.fe`: 13 test fns, expected values computed by the independent Python
   oracle `tools/gen_vectors.py` (exact arbitrary-precision integers).
 - No network, no spend, no stubs, no TODO/FIXME markers found in `src/`, `tools/`.
-- Status: **VERIFIED** (both backends). NOT submitted — submission remains a
-  founder step; deadline on record is Nov 24, 2026, 23:59 UTC.
+- Status: **VERIFIED** (both backends). NOT submitted (as of this
+  version's verification, Nov 20, 2026) — submission was a founder step
+  at that time; deadline on record is Nov 24, 2026, 23:59 UTC.
+  **Update 2026-11-23:** superseded — v0.4.1 was pushed and FE-089 was
+  re-filed and accepted at commit `d9bcaa86`.
 
 ---
 
@@ -404,10 +408,11 @@ Complexity (per operation, from the implementation in
 - Known limits (also in README.md): reciprocal is ~1-2 ulp, not exact;
   `Q<31>` reciprocal always saturates; frame statistics are Q15-only;
   no FFT/resampling yet.
-- Status: **VERIFIED** (both backends). **NOT pushed, NOT re-submitted.**
-  The FE-089 form still points at the v0.1.0 head commit
-  `0a0159006392f1e14cd4351fa12653c57d63c817`; re-submission before Nov 24,
-  2026, 23:59 UTC is a separate founder step if v0.2.0 is to be judged.
+- Status: **VERIFIED** (both backends). **NOT pushed, NOT re-submitted**
+  (as of this version's verification, Nov 20, 2026). **Update
+  2026-11-23:** superseded — v0.4.1 was pushed and FE-089 was re-filed
+  and accepted at commit `d9bcaa86`; this line records the state at this
+  version's verification date.
 - Code commit: `c9e310582ff7c91680173cb1fd61fe4a23539707` (this VERIFICATION.md committed
   separately as the head; the two commits differ only in this file).
 
@@ -477,9 +482,10 @@ Complexity (per operation, from the implementation in
   no resampling yet; gas use unmeasured.
 - Nothing left out: all three requested upgrades (FFT, demo, DeFi note)
   are built and green. No improvement proved infeasible in Fe 26.5.
-- Status: **VERIFIED** (both backends). **NOT pushed, NOT re-submitted.**
-  The FE-089 form still points at the v0.1.0 head commit
-  `0a0159006392f1e14cd4351fa12653c57d63c817`; re-submission before Nov 24,
-  2026, 23:59 UTC is a separate founder step if v0.3.0 is to be judged.
+- Status: **VERIFIED** (both backends). **NOT pushed, NOT re-submitted**
+  (as of this version's verification, Nov 20, 2026). **Update
+  2026-11-23:** superseded — v0.4.1 was pushed and FE-089 was re-filed
+  and accepted at commit `d9bcaa86`; this line records the state at this
+  version's verification date.
 - Code commit: `00da348146829f0c4f8973a8dc9ea53c8200a819` (this VERIFICATION.md committed
   separately as the head; the two commits differ only in this file).
